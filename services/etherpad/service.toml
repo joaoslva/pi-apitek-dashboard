@@ -1,0 +1,43 @@
+id          = "etherpad"
+title       = "Etherpad"
+description = "Shared notes for the meeting"
+icon        = "pad"
+
+[route]
+prefix       = "/pad/"
+upstream     = "http://127.0.0.1:9001"
+strip_prefix = true
+
+[run]
+units         = ["etherpad.service"]
+# Verify the health endpoint when the bundle lands (Phase 5).
+ready_path    = "/health"
+# Cold start measured at 51 s on the Zero 2 W.
+start_timeout = "120s"
+auto          = true
+# An open pad holds a websocket, so an attended meeting never counts as idle.
+idle_stop     = "20m"
+exclusive     = ["foreground"]
+
+[memory]
+# Measured: ~200 MB peak during startup, ~128 MB steady with one client,
+# plus an ~18 MB esbuild helper in the same unit.
+budget = "200M"
+max    = "300M"
+
+[access]
+level = "use"
+
+# Etherpad's own admin UI stays disabled (no admin users in settings.json);
+# this is the second lock. Path list to be confirmed in Phase 5.
+[[access.rules]]
+path  = "/admin"
+level = "owner"
+
+[[access.rules]]
+path  = "/api"
+level = "owner"
+
+[[access.rules]]
+path  = "/stats"
+level = "owner"

@@ -1,0 +1,9 @@
+[Unit]
+Description=Keep camera-drive reachable (join known WiFi, else self-host)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/camera-net-fallback
+TimeoutStartSec=120

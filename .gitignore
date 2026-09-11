@@ -1,0 +1,10 @@
+# Local data backups pulled from the Pi. Personal media, never committed.
+backups/
+
+# Build output
+dist/
+build/
+
+# Python
+__pycache__/
+*.pyc

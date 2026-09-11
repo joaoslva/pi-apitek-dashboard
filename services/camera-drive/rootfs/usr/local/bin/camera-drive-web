@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+"""
+The phone-facing web UI for camera-drive.
+
+Runs unprivileged as joao. The only privileged things it can do are shell out
+to `sudo camera-wipe` (which enforces its own safety rule independently) and
+`sudo systemctl poweroff`. This app is never trusted to decide what is safe to
+delete.
+
+Live view and camera control work by talking to camera-live through a JSON file
+in /run/camera-drive. Both processes run as joao, so there is no socket, no
+daemon protocol and no privilege boundary to get wrong. This app never opens
+/dev/video0 itself; camera-live owns it, because only one process can.
+
+Recordings are MJPEG in Matroska, which no browser can decode. Default playback
+unwraps the JPEG frames they already contain and streams them as multipart,
+exactly like the live view -- instant, and no re-encoding at all. An <img> has
+no audio channel though, so /api/mp4 transcodes on demand and caches the result
+for playback with sound and a seek bar. Note that re-encoding is only slow in
+the LIVE capture path (a quarter of realtime); from a file the Pi's hardware
+encoder manages 3.3x realtime.
+
+Served by waitress on port 80 so the Pi is reachable at a bare IP from a phone.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import mimetypes
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+from flask import (Flask, Response, abort, after_this_request, jsonify,
+                   request, send_file, send_from_directory)
+from PIL import Image
+
+ROOT = Path("/srv/camera-drive")
+MEDIA = ROOT / "media"
+VIDEO = ROOT / "video"
+THUMBS = ROOT / "thumbs"
+PROXY = ROOT / "proxy"
+TMP = ROOT / "tmp"
+STATUS_PATH = ROOT / "status.json"
+RECSTATUS_PATH = ROOT / "recstatus.json"
+INDEX_PATH = ROOT / "index.json"
+
+RUN = Path("/run/camera-drive")
+LIVE_JPG = RUN / "live.jpg"
+CONTROL = RUN / "control.json"
+
+SERVE_ROOTS = (MEDIA, VIDEO)
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+VIDEO_SUFFIXES = {".avi", ".mov", ".mp4", ".mkv"}
+THUMB_PX = 320
+
+# JPEG markers. ffmpeg rewrites live.jpg in place many times a second, so a
+# reader can catch a half-written file; frames not ending in EOI are dropped
+# rather than shown torn. The same markers split the demuxed playback stream.
+JPEG_SOI = b"\xff\xd8\xff"
+JPEG_EOI = b"\xff\xd9"
+
+app = Flask(__name__)
+
+
+# --------------------------------------------------------------------------
+# data
+# --------------------------------------------------------------------------
+
+def read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def camera_state() -> dict:
+    try:
+        out = subprocess.run(["lsusb"], capture_output=True, text=True,
+                             timeout=5).stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return {"connected": False, "mode": "unknown"}
+    if "08ca:2023" in out:
+        return {"connected": True, "mode": "storage"}
+    if "08ca:2022" in out:
+        return {"connected": True, "mode": "live"}
+    return {"connected": False, "mode": "none"}
+
+
+def disk_state() -> dict:
+    u = shutil.disk_usage(ROOT)
+    return {"total": u.total, "used": u.total - u.free, "free": u.free,
+            "pct": round((u.total - u.free) / u.total * 100, 1)}
+
+
+def _pretty_folder(name: str) -> str:
+    if name == "snapshots":
+        return "Snapshots"
+    try:
+        return datetime.strptime(name, "%Y-%m-%d_%H%M%S").strftime("%d %b %Y, %H:%M")
+    except ValueError:
+        return name
+
+
+def list_dumps() -> list[dict]:
+    dumps = []
+    if not MEDIA.exists():
+        return dumps
+    for folder in sorted(MEDIA.iterdir(), reverse=True):
+        if not folder.is_dir():
+            continue
+        items = []
+        for f in sorted(folder.iterdir(), reverse=True):
+            suffix = f.suffix.lower()
+            if suffix not in IMAGE_SUFFIXES | VIDEO_SUFFIXES:
+                continue
+            items.append({"name": f.name,
+                          "path": f"media/{folder.name}/{f.name}",
+                          "size": f.stat().st_size,
+                          "kind": "video" if suffix in VIDEO_SUFFIXES else "image"})
+        if items:
+            dumps.append({"folder": folder.name,
+                          "label": _pretty_folder(folder.name),
+                          "count": len(items),
+                          "bytes": sum(i["size"] for i in items),
+                          "items": items})
+    return dumps
+
+
+def list_recordings() -> list[dict]:
+    items = []
+    if not VIDEO.exists():
+        return items
+    for f in sorted(VIDEO.iterdir(), reverse=True):
+        if not f.is_file() or f.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        items.append({"name": f.name, "path": f"video/{f.name}",
+                      "size": f.stat().st_size,
+                      "label": _pretty_folder(f.stem), "kind": "video",
+                      "proxy": (PROXY / (f.stem + ".mp4")).exists()})
+    return items
+
+
+def safe_media_path(rel: str) -> Path:
+    """Resolve under one of SERVE_ROOTS or refuse. Paths come from URLs and
+    form fields, so this is the only thing between a crafted request and the
+    rest of the filesystem."""
+    target = (ROOT / rel).resolve()
+    for base in SERVE_ROOTS:
+        if str(target).startswith(str(base.resolve()) + os.sep):
+            break
+    else:
+        abort(404)
+    if not target.is_file():
+        abort(404)
+    return target
+
+
+# --------------------------------------------------------------------------
+# live view and playback
+# --------------------------------------------------------------------------
+
+def read_live_frame() -> bytes | None:
+    try:
+        data = LIVE_JPG.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 1024 or not data.endswith(JPEG_EOI):
+        return None
+    return data
+
+
+def control_update(**kw) -> dict:
+    cur = read_json(CONTROL, {"preview": False, "recording": False,
+                              "snapshot_seq": 0})
+    cur.update(kw)
+    RUN.mkdir(parents=True, exist_ok=True)
+    tmp = CONTROL.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cur))
+    os.replace(tmp, CONTROL)
+    return cur
+
+
+def multipart(frame: bytes) -> bytes:
+    return (b"--frame\r\nContent-Type: image/jpeg\r\n"
+            + f"Content-Length: {len(frame)}\r\n\r\n".encode() + frame + b"\r\n")
+
+
+def live_stream():
+    last, idle = None, 0
+    while True:
+        frame = read_live_frame()
+        if frame and frame != last:
+            last, idle = frame, 0
+            yield multipart(frame)
+        else:
+            idle += 1
+            # Viewfinder switched off or camera unplugged: end the stream
+            # rather than holding a waitress thread open forever.
+            if idle > 60:
+                return
+        time.sleep(0.08)
+
+
+def play_stream(path: Path):
+    """
+    Play a recording by unwrapping the JPEG frames it already contains.
+
+    -re paces ffmpeg at the file's native rate so playback runs at real speed,
+    and -c:v copy means no decoding or re-encoding happens anywhere.
+    """
+    proc = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-re", "-i", str(path),
+         "-c:v", "copy", "-f", "image2pipe", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    buf = b""
+    try:
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                end = buf.find(JPEG_EOI)
+                if end == -1:
+                    break
+                frame, buf = buf[:end + 2], buf[end + 2:]
+                start = frame.find(JPEG_SOI)
+                if start != -1:
+                    yield multipart(frame[start:])
+    except GeneratorExit:
+        pass
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+# --------------------------------------------------------------------------
+# thumbnails
+# --------------------------------------------------------------------------
+
+def thumb_for(rel: str) -> Path | None:
+    src = safe_media_path(rel)
+    key = hashlib.sha256(f"{rel}:{src.stat().st_mtime_ns}".encode()).hexdigest()[:32]
+    dest = THUMBS / f"{key}.jpg"
+    if dest.exists():
+        return dest
+    THUMBS.mkdir(parents=True, exist_ok=True)
+    suffix = src.suffix.lower()
+    try:
+        if suffix in IMAGE_SUFFIXES:
+            with Image.open(src) as im:
+                im = im.convert("RGB")
+                im.thumbnail((THUMB_PX, THUMB_PX))
+                im.save(dest, "JPEG", quality=80)
+        elif suffix in VIDEO_SUFFIXES:
+            # Seek in a little: frame 0 is often the lens cap, or a frame the
+            # auto-exposure has not settled on yet.
+            for args in (["-ss", "1", "-i", str(src)], ["-i", str(src)]):
+                subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error",
+                                *args, "-frames:v", "1",
+                                "-vf", f"scale={THUMB_PX}:-1", "-y", str(dest)],
+                               check=False, capture_output=True, timeout=90)
+                if dest.exists():
+                    break
+        else:
+            return None
+    except Exception:
+        return None
+    return dest if dest.exists() else None
+
+
+# --------------------------------------------------------------------------
+# routes
+# --------------------------------------------------------------------------
+
+@app.get("/api/state")
+def api_state():
+    return jsonify({
+        "camera": camera_state(),
+        "disk": disk_state(),
+        "status": read_json(STATUS_PATH, {}),
+        "recstatus": read_json(RECSTATUS_PATH, {}),
+        "control": read_json(CONTROL, {}),
+        "live": LIVE_JPG.exists(),
+        "held": len(read_json(INDEX_PATH, {})),
+        "dumps": list_dumps(),
+        "recordings": list_recordings(),
+    })
+
+
+@app.get("/api/stream")
+def api_stream():
+    if not LIVE_JPG.exists():
+        abort(503)
+    return Response(live_stream(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/play/<path:rel>")
+def api_play(rel: str):
+    path = safe_media_path(rel)
+    if path.suffix.lower() not in VIDEO_SUFFIXES:
+        abort(400)
+    return Response(play_stream(path),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/live.jpg")
+def api_live_jpg():
+    frame = read_live_frame()
+    if not frame:
+        abort(503)
+    return Response(frame, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/control")
+def api_control():
+    body = request.json or {}
+    out = {}
+    if "preview" in body:
+        out = control_update(preview=bool(body["preview"]))
+    if "recording" in body:
+        # Recording implies the capture pipeline, so switching it on also
+        # turns the viewfinder on rather than fighting with it.
+        kw = {"recording": bool(body["recording"])}
+        if body["recording"]:
+            kw["preview"] = True
+        out = control_update(**kw)
+    if body.get("snapshot"):
+        cur = read_json(CONTROL, {})
+        out = control_update(snapshot_seq=int(cur.get("snapshot_seq", 0)) + 1)
+    if not out:
+        return jsonify({"ok": False, "error": "nothing to do"}), 400
+    return jsonify({"ok": True, "control": out})
+
+
+@app.post("/api/power")
+def api_power():
+    """Shut the Pi down cleanly. Pulling the plug on a running Pi is the
+    reliable way to corrupt an SD card eventually."""
+    try:
+        # Fire and forget: systemd takes a few seconds to actually halt, which
+        # is long enough for this response to reach the phone.
+        subprocess.Popen(["sudo", "-n", "systemctl", "poweroff"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True})
+
+
+@app.get("/api/mp4/<path:rel>")
+def api_mp4(rel: str):
+    """
+    An H.264 + AAC copy of a recording, so it plays in a real <video> element
+    with sound and a seek bar. Transcoded once on demand, then cached.
+
+    The in-app MJPEG preview stays the default because it is instant and free;
+    this is the "I want the audio" path. Measured on this Pi: the hardware
+    encoder does 3.3x realtime, so a one minute clip takes about 18 seconds.
+
+    h264_v4l2m2m only produced invalid output in the live-capture pipeline,
+    where it was paired with fragmented MP4. From a file into a normal
+    +faststart MP4 it is fine -- but fall back to libx264 if it ever is not.
+    """
+    src = safe_media_path(rel)
+    if src.suffix.lower() not in VIDEO_SUFFIXES:
+        abort(400)
+    PROXY.mkdir(parents=True, exist_ok=True)
+    dest = PROXY / (src.stem + ".mp4")
+
+    if not dest.exists():
+        tmp = dest.with_suffix(".part")
+        # -f mp4 is REQUIRED, not decorative. ffmpeg picks its muxer from the
+        # output file extension, and the ".part" name (used so a half-written
+        # transcode is never served) means nothing to it -- without this it
+        # fails instantly with "unable to find a suitable output format".
+        common = ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
+                  "-movflags", "+faststart", "-f", "mp4", "-y", str(tmp)]
+        for vcodec in (["-c:v", "h264_v4l2m2m", "-b:v", "1500k"],
+                       ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"]):
+            try:
+                subprocess.run(["ffmpeg", "-v", "error", "-i", str(src),
+                                *vcodec, *common],
+                               check=False, capture_output=True, timeout=3600)
+            except subprocess.SubprocessError:
+                continue
+            # A valid result must both exist and decode.
+            if tmp.exists() and tmp.stat().st_size > 1024:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries",
+                     "format=duration", "-of", "csv=p=0", str(tmp)],
+                    capture_output=True, text=True)
+                if probe.returncode == 0 and probe.stdout.strip():
+                    break
+            tmp.unlink(missing_ok=True)
+        if not tmp.exists():
+            abort(500)
+        os.replace(tmp, dest)
+
+    # conditional=True gives range requests, which is what makes seeking work.
+    return send_file(dest, mimetype="video/mp4", conditional=True)
+
+
+@app.get("/media/<path:rel>")
+def media(rel: str):
+    path = safe_media_path(rel)
+    mime, _ = mimetypes.guess_type(path.name)
+    # Browsers cannot decode MJPEG/Matroska, and left to themselves they show
+    # a bare "no supported source" error. Send video as a download instead;
+    # in-app playback goes through /api/play.
+    as_attach = path.suffix.lower() in VIDEO_SUFFIXES or "dl" in request.args
+    return send_file(path, mimetype=mime or "application/octet-stream",
+                     conditional=True, as_attachment=as_attach,
+                     download_name=path.name if as_attach else None)
+
+
+@app.get("/thumb/<path:rel>")
+def thumb(rel: str):
+    t = thumb_for(rel)
+    if not t:
+        abort(404)
+    return send_from_directory(t.parent, t.name, mimetype="image/jpeg",
+                               max_age=86400)
+
+
+@app.post("/api/zip")
+def api_zip():
+    """
+    Bundle the selected files. Submitted as a normal form so the browser
+    handles the download itself instead of buffering a blob in phone memory.
+
+    ZIP_STORED, not DEFLATE: JPEG and MJPEG are already compressed, so
+    deflating them burns CPU on a Zero 2 W to save almost nothing.
+    """
+    rels = request.form.getlist("path")
+    if not rels:
+        abort(400)
+    paths = [safe_media_path(r) for r in rels[:500]]
+
+    TMP.mkdir(parents=True, exist_ok=True)
+    fd, tmpname = tempfile.mkstemp(suffix=".zip", dir=TMP)
+    os.close(fd)
+    tmppath = Path(tmpname)
+
+    with zipfile.ZipFile(tmppath, "w", zipfile.ZIP_STORED) as z:
+        for p in paths:
+            z.write(p, arcname=p.name)
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            tmppath.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return response
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    return send_file(tmppath, mimetype="application/zip", as_attachment=True,
+                     download_name=f"camera-drive_{stamp}.zip")
+
+
+@app.post("/api/wipe")
+def api_wipe():
+    commit = bool(request.json and request.json.get("commit"))
+    flag = "--commit" if commit else "--dry-run"
+    try:
+        res = subprocess.run(["sudo", "-n", "/usr/local/bin/camera-wipe", flag],
+                             capture_output=True, text=True, timeout=900)
+    except subprocess.SubprocessError as exc:
+        return jsonify({"ok": False, "errors": [str(exc)]}), 500
+    try:
+        payload = json.loads(res.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return jsonify({"ok": False,
+                        "errors": ["could not parse camera-wipe output",
+                                   res.stdout[-400:], res.stderr[-400:]]}), 500
+    return jsonify(payload)
+
+
+@app.get("/")
+def index() -> Response:
+    return Response(PAGE, mimetype="text/html")
+
+
+# --------------------------------------------------------------------------
+# the page
+# --------------------------------------------------------------------------
+
+# Pixel-art camera on a 16x16 grid, crisp-edged so it stays blocky at any size.
+_ICON_BODY = (
+    "<rect x='5' y='1' width='4' height='2' fill='{o}'/>"
+    "<rect x='1' y='3' width='14' height='11' fill='{o}'/>"
+    "<rect x='4' y='5' width='8' height='8' fill='{d}'/>"
+    "<rect x='5' y='6' width='6' height='6' fill='{g}'/>"
+    "<rect x='7' y='8' width='2' height='2' fill='{l}'/>"
+    "<rect x='12' y='4' width='2' height='2' fill='{r}'/>"
+)
+ICON_INLINE = ("<svg viewBox='0 0 16 16' shape-rendering='crispEdges'>"
+               + _ICON_BODY.format(o="#DFA05D", d="#17150F", g="#658761",
+                                   l="#EDE4D3", r="#AC5045") + "</svg>")
+ICON_URI = ("data:image/svg+xml,"
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' "
+            "shape-rendering='crispEdges'>"
+            "<rect width='16' height='16' fill='%2317150F'/>"
+            + _ICON_BODY.format(o="%23DFA05D", d="%2317150F", g="%23658761",
+                                l="%23EDE4D3", r="%23AC5045") + "</svg>")
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>CAMERA-DRIVE</title>
+<link rel="icon" href="__ICON_URI__">
+<style>
+  /* Dark is the primary design; light is a full re-skin of the same tokens. */
+  :root{
+    --bg:#17150F; --panel:#211E18; --panel2:#2B2720; --line:#4A4133;
+    --fg:#EDE4D3; --dim:#9A8F7C;
+    --orange:#DFA05D; --red:#AC5045; --green:#658761;
+    --shadow:3px 3px 0 #0c0b08; --scan:rgba(0,0,0,.16);
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#E9E0C9; --panel:#DED3B6; --panel2:#D2C6A4; --line:#8B7F5F;
+      --fg:#241F16; --dim:#6A6047;
+      --orange:#B0722C; --red:#96382E; --green:#4C6647;
+      --shadow:3px 3px 0 #8B7F5F; --scan:rgba(0,0,0,.05);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#E9E0C9; --panel:#DED3B6; --panel2:#D2C6A4; --line:#8B7F5F;
+    --fg:#241F16; --dim:#6A6047;
+    --orange:#B0722C; --red:#96382E; --green:#4C6647;
+    --shadow:3px 3px 0 #8B7F5F; --scan:rgba(0,0,0,.05);
+  }
+
+  *{box-sizing:border-box}
+  /* MUST come before any rule that sets display. The hidden attribute only
+     works via a UA rule of display:none, so an author rule like
+     .lb{display:flex} silently overrides it and the element is permanently
+     visible -- which, for a position:fixed inset:0 lightbox, means it covers
+     the whole app and the close button appears to do nothing. */
+  [hidden]{display:none !important}
+  html,body{background:var(--bg);color:var(--fg)}
+  body{margin:0;font:13px/1.5 ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
+       padding:env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 76px);
+       -webkit-font-smoothing:none}
+  body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:99;
+    background:repeating-linear-gradient(180deg,var(--scan) 0 1px,transparent 1px 3px)}
+  img{image-rendering:pixelated}
+
+  header{position:sticky;top:0;z-index:10;background:var(--panel);
+         border-bottom:2px solid var(--line)}
+  .titlebar{display:flex;align-items:center;gap:8px;padding:6px 8px;
+            background:var(--orange);color:#17150F;border-bottom:2px solid var(--line)}
+  .titlebar svg{width:18px;height:18px;display:block;flex:none}
+  .titlebar b{font-size:13px;letter-spacing:2px}
+  .titlebar .fill{flex:1;height:9px;opacity:.5;
+    background:repeating-linear-gradient(90deg,#17150F 0 2px,transparent 2px 4px)}
+  .tbtn{font:inherit;font-size:12px;line-height:1;padding:4px 7px;cursor:pointer;
+        background:transparent;color:#17150F;border:2px solid #17150F}
+  .tbtn:active{transform:translate(1px,1px)}
+
+  .meta{padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+  .row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .spread{justify-content:space-between}
+  .pill{font-size:11px;letter-spacing:.6px;text-transform:uppercase;padding:3px 7px;
+        border:2px solid var(--line);color:var(--dim);white-space:nowrap;background:var(--panel2)}
+  .pill.on{color:var(--green);border-color:var(--green)}
+  .pill.live{color:var(--orange);border-color:var(--orange)}
+  .pill.rec{color:var(--red);border-color:var(--red)}
+  .gauge{font-size:12px;letter-spacing:-1px;color:var(--line)}
+  .gauge b{color:var(--green);font-weight:400}
+  .muted{color:var(--dim);font-size:11.5px}
+
+  nav{display:flex;border-top:2px solid var(--line)}
+  nav button{flex:1;font:inherit;font-size:11.5px;letter-spacing:1.4px;text-transform:uppercase;
+    padding:10px 4px;background:var(--panel2);color:var(--dim);border:0;
+    border-right:2px solid var(--line);cursor:pointer}
+  nav button:last-child{border-right:0}
+  nav button[aria-selected="true"]{background:var(--orange);color:#17150F;font-weight:700}
+
+  main{padding:12px 10px}
+  section{margin-bottom:20px}
+  h2{font-size:11px;text-transform:uppercase;letter-spacing:1.6px;color:var(--orange);
+     margin:0 0 9px;font-weight:700;border-bottom:2px solid var(--line);padding-bottom:5px}
+  h2 span{color:var(--dim);font-weight:400;letter-spacing:.5px;text-transform:none}
+
+  .grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(98px,1fr))}
+  .cell{position:relative;aspect-ratio:1;overflow:hidden;display:block;cursor:pointer;
+        background:var(--panel);border:2px solid var(--line);box-shadow:var(--shadow)}
+  .cell img{width:100%;height:100%;object-fit:cover;display:block}
+  .cell .badge{position:absolute;left:0;bottom:0;background:#17150Fdd;color:#EDE4D3;
+    font-size:9.5px;padding:2px 4px;border-top:2px solid var(--line);border-right:2px solid var(--line)}
+  .cell.sel{border-color:var(--green);box-shadow:0 0 0 2px var(--green)}
+  .cell .tick{position:absolute;right:4px;top:4px;width:20px;height:20px;
+    border:2px solid var(--line);background:#17150Fcc;color:transparent;
+    font-size:13px;line-height:16px;text-align:center}
+  .cell.sel .tick{background:var(--green);color:#12160f;border-color:var(--green)}
+
+  button.btn{font:inherit;font-size:12px;letter-spacing:1.2px;text-transform:uppercase;
+    padding:11px 15px;background:var(--panel2);color:var(--fg);
+    border:2px solid var(--line);box-shadow:var(--shadow);cursor:pointer}
+  button.btn:active{transform:translate(3px,3px);box-shadow:none}
+  button.btn:disabled{opacity:.35;cursor:not-allowed;box-shadow:none}
+  button.shoot{background:var(--green);color:#12160f;border-color:var(--green);font-weight:700}
+  button.rec{background:var(--red);color:#fff2ee;border-color:var(--red);font-weight:700}
+  button.stop{background:var(--orange);color:#17150F;border-color:var(--orange);font-weight:700}
+  button.danger{color:var(--red);border-color:var(--red)}
+  button.small{padding:7px 10px;font-size:11px}
+
+  .viewer{border:2px solid var(--line);background:#000;box-shadow:var(--shadow);
+    aspect-ratio:464/480;max-height:54vh;margin:0 auto 12px;display:flex;
+    align-items:center;justify-content:center;overflow:hidden}
+  .viewer img{width:100%;height:100%;object-fit:contain;display:block}
+  .viewer .off{color:var(--dim);font-size:11.5px;text-align:center;padding:18px;line-height:1.9}
+  .reclamp{display:inline-block;width:9px;height:9px;background:var(--red);
+    margin-right:6px;vertical-align:-1px;animation:bl 1s steps(1) infinite}
+  @keyframes bl{50%{opacity:.15}}
+
+  /* selection action bar */
+  .actionbar{position:fixed;left:0;right:0;bottom:0;z-index:20;background:var(--panel);
+    border-top:2px solid var(--line);padding:10px;
+    padding-bottom:calc(10px + env(safe-area-inset-bottom));
+    display:flex;gap:8px;align-items:center;justify-content:space-between}
+
+  /* lightbox */
+  .lb{position:fixed;inset:0;z-index:60;background:var(--bg);display:flex;
+      flex-direction:column}
+  .lb .lbhead{display:flex;align-items:center;gap:8px;padding:8px 10px;
+    background:var(--orange);color:#17150F;border-bottom:2px solid var(--line)}
+  .lb .lbhead b{flex:1;font-size:11.5px;letter-spacing:.5px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .lb .lbstage{flex:1;display:flex;align-items:center;justify-content:center;
+    background:#000;overflow:hidden;min-height:0}
+  .lb .lbstage img,.lb .lbstage video{max-width:100%;max-height:100%;object-fit:contain;display:block}
+  .lb .lbnote{color:var(--dim);text-align:center;padding:22px;line-height:1.9;font-size:11.5px}
+  .lb .lbfoot{display:flex;gap:8px;align-items:center;justify-content:space-between;
+    padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom));
+    background:var(--panel);border-top:2px solid var(--line)}
+  .lb .count{font-size:11px;color:var(--dim)}
+
+  dialog{border:2px solid var(--line);background:var(--panel);color:var(--fg);
+    box-shadow:6px 6px 0 var(--line);padding:0;max-width:min(430px,92vw);font:inherit;font-size:12.5px}
+  dialog::backdrop{background:#17150Fd9}
+  .dlghead{background:var(--red);color:#fff2ee;padding:7px 10px;font-weight:700;
+    letter-spacing:1.4px;text-transform:uppercase;font-size:11.5px}
+  .dlgbody{padding:13px}
+  .empty{color:var(--dim);text-align:center;padding:40px 16px;line-height:2}
+  code{background:var(--panel2);border:2px solid var(--line);padding:1px 5px;color:var(--orange)}
+</style>
+</head>
+<body>
+<header>
+  <div class="titlebar">
+    __ICON_INLINE__
+    <b>CAMERA-DRIVE</b><span class="fill"></span>
+    <button class="tbtn" id="theme" title="light / dark">◐</button>
+    <button class="tbtn" id="power" title="shut down">⏻</button>
+  </div>
+  <div class="meta">
+    <div class="row">
+      <span class="pill" id="cam">CAMERA: ...</span>
+      <span class="pill" id="last">...</span>
+    </div>
+    <div class="row spread">
+      <span class="gauge" id="gauge"></span>
+      <span class="muted" id="held"></span>
+    </div>
+  </div>
+  <nav role="tablist">
+    <button role="tab" data-tab="live" aria-selected="true">Live</button>
+    <button role="tab" data-tab="photos" aria-selected="false">Photos</button>
+    <button role="tab" data-tab="recs" aria-selected="false">Tapes</button>
+  </nav>
+</header>
+
+<main>
+  <div id="tab-live">
+    <div class="viewer" id="viewer"><div class="off">connecting...</div></div>
+    <div class="row" style="justify-content:center">
+      <button class="btn" id="vf">▶ Viewfinder</button>
+      <button class="btn shoot" id="shoot" disabled>● Shoot</button>
+      <button class="btn rec" id="rec" disabled>⏺ Record</button>
+    </div>
+    <p class="muted" style="text-align:center;margin-top:12px" id="livehint"></p>
+  </div>
+
+  <div id="tab-photos" hidden>
+    <div class="row spread" style="margin-bottom:12px">
+      <button class="btn small" data-select="photos">Select</button>
+      <button class="btn small danger" id="wipe" disabled>Wipe camera</button>
+    </div>
+    <div id="photos"></div>
+  </div>
+
+  <div id="tab-recs" hidden>
+    <div class="row spread" style="margin-bottom:12px">
+      <button class="btn small" data-select="recs">Select</button>
+      <span class="muted" id="recnote"></span>
+    </div>
+    <div id="recs"></div>
+  </div>
+</main>
+
+<div class="actionbar" id="actionbar" hidden>
+  <span id="selcount">0 selected</span>
+  <span class="row">
+    <button class="btn small" id="selcancel">Cancel</button>
+    <button class="btn small shoot" id="seldl">Download .zip</button>
+  </span>
+</div>
+
+<div class="lb" id="lb" hidden>
+  <div class="lbhead"><b id="lbname"></b>
+    <button class="tbtn" id="lbclose">✕</button></div>
+  <div class="lbstage" id="lbstage"></div>
+  <div class="lbfoot">
+    <button class="btn small" id="lbprev">‹ Prev</button>
+    <span class="count" id="lbcount"></span>
+    <button class="btn small" id="lbsound" hidden>♪ Sound</button>
+    <button class="btn small" id="lbdl">Save</button>
+    <button class="btn small" id="lbnext">Next ›</button>
+  </div>
+</div>
+
+<dialog id="dlg">
+  <div class="dlghead" id="dlghead">Confirm</div>
+  <div class="dlgbody">
+    <div id="dlgBody"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:15px">
+      <button class="btn small" id="cancel">Cancel</button>
+      <button class="btn small rec" id="confirm" hidden>OK</button>
+    </div>
+  </div>
+</dialog>
+
+<script>
+const fmt=b=>b>=1073741824?(b/1073741824).toFixed(1)+'G':b>=1048576?(b/1048576).toFixed(1)+'M'
+   :b>=1024?(b/1024).toFixed(0)+'K':b+'B';
+// Fills by space REMAINING, matching the "free" figure beside it.
+const bar=f=>{const n=16,on=Math.max(0,Math.min(n,Math.round(f/100*n)));
+  return '<b>'+'█'.repeat(on)+'</b>'+'░'.repeat(n-on);};
+
+let state=null, tab='live', streaming=false;
+let selMode=null, sel=new Set(), lbList=[], lbIdx=0;
+
+/* ---------- theme ---------- */
+const savedTheme=localStorage.getItem('cd-theme');
+if(savedTheme) document.documentElement.dataset.theme=savedTheme;
+document.getElementById('theme').onclick=()=>{
+  const cur=document.documentElement.dataset.theme
+    || (matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');
+  const next=cur==='dark'?'light':'dark';
+  document.documentElement.dataset.theme=next;
+  localStorage.setItem('cd-theme',next);
+};
+
+/* ---------- tabs ---------- */
+document.querySelectorAll('nav button').forEach(b=>{
+  b.onclick=()=>{
+    tab=b.dataset.tab; exitSelect();
+    document.querySelectorAll('nav button').forEach(x=>
+      x.setAttribute('aria-selected',String(x===b)));
+    document.getElementById('tab-live').hidden=tab!=='live';
+    document.getElementById('tab-photos').hidden=tab!=='photos';
+    document.getElementById('tab-recs').hidden=tab!=='recs';
+    syncStream();
+  };
+});
+
+/* ---------- live view ---------- */
+function syncStream(){
+  const v=document.getElementById('viewer');
+  const want=(tab==='live'&&state&&state.camera.mode==='live'&&state.live);
+  if(want&&!streaming){
+    v.innerHTML='<img id="liveimg" alt="live view">';
+    const im=document.getElementById('liveimg');
+    im.src='/api/stream?t='+Date.now();
+    im.onerror=()=>{streaming=false;};
+    streaming=true;
+  }else if(!want&&streaming){
+    v.innerHTML='<div class="off"></div>'; streaming=false;
+  }
+  if(!streaming&&tab==='live'){
+    const off=v.querySelector('.off'); if(!off) return;
+    off.innerHTML = !state ? 'connecting...'
+      : state.camera.mode==='storage'
+        ? 'Camera is in STORAGE mode.<br>Photos offload automatically.<br><br>Switch it to LIVE for the viewfinder.'
+      : state.camera.mode!=='live'
+        ? 'No camera connected.<br><br>Plug it in as <code>live</code><br>to use the viewfinder.'
+      : 'Viewfinder is off.<br>The camera sensor is idle.<br><br>Press <b>Viewfinder</b> to wake it.';
+  }
+}
+
+async function refresh(){
+  try{ state=await (await fetch('/api/state',{cache:'no-store'})).json(); }catch(e){ return; }
+  const c=state.camera,r=state.recstatus||{},s=state.status||{},ctl=state.control||{};
+
+  const cam=document.getElementById('cam');
+  cam.textContent='camera: '+(c.mode==='storage'?'storage':c.mode==='live'?'live':'none');
+  cam.className='pill '+(c.mode==='storage'?'on':c.mode==='live'?'live':'');
+
+  const last=document.getElementById('last');
+  if(r.recording){last.innerHTML='<i class="reclamp"></i>rec '+(r.file||'');last.className='pill rec';}
+  else if(s.state==='copying'){last.textContent='copying '+(s.done||0)+'/'+(s.total||0);last.className='pill live';}
+  else {last.textContent=s.last_result||'idle';last.className='pill';}
+
+  const d=state.disk;
+  document.getElementById('gauge').innerHTML=bar(100-d.pct)+' '+fmt(d.free)+' free';
+  document.getElementById('held').textContent=state.held+' held';
+
+  const isLive=c.mode==='live', on=!!ctl.preview, ready=isLive&&state.live;
+  const vf=document.getElementById('vf');
+  vf.disabled=!isLive;
+  vf.textContent=on?'■ Viewfinder':'▶ Viewfinder';
+  vf.className='btn '+(on?'stop':'');
+  document.getElementById('shoot').disabled=!ready;
+  document.getElementById('rec').disabled=!isLive;
+  const rb=document.getElementById('rec');
+  rb.textContent=r.recording?'■ Stop':'⏺ Record';
+  rb.className='btn '+(r.recording?'stop':'rec');
+  document.getElementById('livehint').textContent =
+    r.recording?'recording to '+(r.file||'')+' — unplugging also stops it cleanly'
+    : ready?'shoot saves the camera’s own frame, no re-encoding'
+    : isLive?'sensor idle — nothing is being captured'
+    : '';
+
+  document.getElementById('wipe').disabled=(c.mode!=='storage');
+  render(); syncStream();
+}
+
+/* ---------- grids ---------- */
+function cell(i,idx,listName){
+  return '<a class="cell'+(sel.has(i.path)?' sel':'')+'" data-path="'+i.path
+   +'" data-list="'+listName+'" data-idx="'+idx+'">'
+   +'<img loading="lazy" src="/thumb/'+encodeURI(i.path)+'" alt="">'
+   +(selMode?'<span class="tick">✓</span>':'')
+   +'<span class="badge">'+(i.kind==='video'?'▶':'')+fmt(i.size)+'</span></a>';
+}
+
+function flatPhotos(){ return state.dumps.flatMap(d=>d.items); }
+
+function render(){
+  const ph=document.getElementById('photos');
+  let k=0;
+  ph.innerHTML=state.dumps.length?state.dumps.map(d=>{
+    const cells=d.items.map(i=>cell(i,k++,'photos')).join('');
+    return '<section><h2>'+d.label+' <span>'+d.count+' / '+fmt(d.bytes)+'</span></h2>'
+      +'<div class="grid">'+cells+'</div></section>';
+  }).join('')
+   :'<div class="empty">No photos yet.<br>Plug the camera in as <code>storage</code>.</div>';
+
+  const recs=state.recordings||[],rc=document.getElementById('recs');
+  rc.innerHTML=recs.length?
+    '<section><h2>Tapes <span>'+recs.length+' / '+fmt(recs.reduce((a,r)=>a+r.size,0))
+    +'</span></h2><div class="grid">'+recs.map((i,n)=>cell(i,n,'recs')).join('')+'</div></section>'
+   :'<div class="empty">No recordings yet.<br>Plug the camera in as <code>live</code> and hit record.</div>';
+  document.getElementById('recnote').textContent=recs.length?'tap to play in-app':'';
+
+  document.querySelectorAll('.cell').forEach(el=>{
+    el.onclick=ev=>{
+      ev.preventDefault();
+      const p=el.dataset.path;
+      if(selMode){
+        sel.has(p)?sel.delete(p):sel.add(p);
+        el.classList.toggle('sel'); updateSelBar(); return;
+      }
+      const list=el.dataset.list==='photos'?flatPhotos():state.recordings;
+      openLb(list,parseInt(el.dataset.idx,10));
+    };
+  });
+}
+
+/* ---------- selection ---------- */
+document.querySelectorAll('[data-select]').forEach(b=>{
+  b.onclick=()=>{ selMode=b.dataset.select; sel.clear(); render(); updateSelBar(); };
+});
+function exitSelect(){ selMode=null; sel.clear(); updateSelBar(); if(state) render(); }
+function updateSelBar(){
+  const ab=document.getElementById('actionbar');
+  ab.hidden=!selMode;
+  document.getElementById('selcount').textContent=sel.size+' selected';
+  document.getElementById('seldl').disabled=sel.size===0;
+}
+document.getElementById('selcancel').onclick=exitSelect;
+document.getElementById('seldl').onclick=()=>{
+  if(!sel.size) return;
+  // A real form post, so the browser streams the download itself rather than
+  // buffering the whole zip in phone memory.
+  const f=document.createElement('form');
+  f.method='POST'; f.action='/api/zip'; f.style.display='none';
+  sel.forEach(p=>{ const i=document.createElement('input');
+    i.type='hidden'; i.name='path'; i.value=p; f.appendChild(i); });
+  document.body.appendChild(f); f.submit();
+  setTimeout(()=>{ f.remove(); exitSelect(); },800);
+};
+
+/* ---------- lightbox ---------- */
+const lb=document.getElementById('lb');
+function openLb(list,idx){ lbList=list; lbIdx=idx; lb.hidden=false; showLb(); }
+function closeLb(){ lb.hidden=true; document.getElementById('lbstage').innerHTML=''; }
+function showLb(){
+  const it=lbList[lbIdx]; if(!it) return closeLb();
+  document.getElementById('lbname').textContent=it.name;
+  document.getElementById('lbcount').textContent=(lbIdx+1)+' / '+lbList.length;
+  // Video plays by unwrapping its JPEG frames server-side, so an <img> is the
+  // right element for both cases -- no <video>, no codec support needed.
+  const src=it.kind==='video'?'/api/play/'+encodeURI(it.path)+'?t='+Date.now()
+                             :'/media/'+encodeURI(it.path);
+  document.getElementById('lbstage').innerHTML='<img alt="'+it.name+'" src="'+src+'">';
+  document.getElementById('lbdl').onclick=()=>{
+    location.href='/media/'+encodeURI(it.path)+'?dl=1'; };
+  // Sound needs a real <video>, which needs H.264. Offered rather than
+  // automatic, because the first play of a clip has to transcode it.
+  const sb=document.getElementById('lbsound');
+  sb.hidden = it.kind!=='video';
+  sb.textContent = it.proxy ? '♪ Sound' : '♪ Sound…';
+}
+
+document.getElementById('lbsound').onclick=()=>{
+  const it=lbList[lbIdx]; if(!it) return;
+  const stage=document.getElementById('lbstage');
+  stage.innerHTML='<div class="lbnote" id="lbnote">'
+    +(it.proxy?'Loading…'
+      :'Converting for sound…<br>runs about 3x faster than the clip is long,<br>and only happens once per recording.')
+    +'</div>';
+  const v=document.createElement('video');
+  v.controls=true; v.autoplay=true; v.playsInline=true; v.style.display='none';
+  v.src='/api/mp4/'+encodeURI(it.path);
+  v.onloadeddata=()=>{ const n=document.getElementById('lbnote'); if(n) n.remove();
+                       v.style.display='block'; v.play().catch(()=>{}); };
+  v.onerror=()=>{ stage.innerHTML='<div class="lbnote">Could not convert this clip.<br>'
+                  +'Use <b>Save</b> and play it in VLC.</div>'; };
+  stage.appendChild(v);
+}
+document.getElementById('lbclose').onclick=closeLb;
+document.getElementById('lbprev').onclick=()=>{ lbIdx=(lbIdx-1+lbList.length)%lbList.length; showLb(); };
+document.getElementById('lbnext').onclick=()=>{ lbIdx=(lbIdx+1)%lbList.length; showLb(); };
+addEventListener('keydown',e=>{
+  if(lb.hidden) return;
+  if(e.key==='Escape') closeLb();
+  if(e.key==='ArrowLeft') document.getElementById('lbprev').click();
+  if(e.key==='ArrowRight') document.getElementById('lbnext').click();
+});
+
+/* ---------- camera control ---------- */
+async function control(body){
+  await fetch('/api/control',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  setTimeout(refresh,400);
+}
+document.getElementById('vf').onclick=()=>control({preview:!(state.control||{}).preview});
+document.getElementById('shoot').onclick=async e=>{
+  const b=e.currentTarget,t=b.textContent;
+  b.disabled=true; b.textContent='✓ Saved';
+  await control({snapshot:true});
+  setTimeout(()=>{b.textContent=t;},900);
+};
+document.getElementById('rec').onclick=()=>control({recording:!(state.recstatus||{}).recording});
+
+/* ---------- dialogs ---------- */
+const dlg=document.getElementById('dlg'),dlgBody=document.getElementById('dlgBody'),
+      dlgHead=document.getElementById('dlghead'),confirmBtn=document.getElementById('confirm');
+document.getElementById('cancel').onclick=()=>dlg.close();
+
+document.getElementById('power').onclick=()=>{
+  dlgHead.textContent='Shut down';
+  dlgBody.innerHTML='<b>Power the Pi off cleanly?</b><p class="muted">Always do this before '
+    +'unplugging it. Pulling power from a running Pi is how SD cards get corrupted.</p>'
+    +'<p class="muted">It takes about 10 seconds. The green LED stops blinking when it is '
+    +'safe to unplug.</p>';
+  confirmBtn.hidden=false; confirmBtn.textContent='Shut down';
+  confirmBtn.onclick=async()=>{
+    dlgBody.innerHTML='<b>Shutting down...</b><p class="muted">Wait for the LED to stop, '
+      +'then unplug.</p>';
+    confirmBtn.hidden=true;
+    await fetch('/api/power',{method:'POST'});
+  };
+  dlg.showModal();
+};
+
+document.getElementById('wipe').onclick=async()=>{
+  dlgHead.textContent='Wipe camera';
+  dlgBody.innerHTML='Checking what is safe to delete...';
+  confirmBtn.hidden=true; dlg.showModal();
+  const r=await (await fetch('/api/wipe',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({commit:false})})).json();
+  let h='';
+  if(r.deleted?.length) h+='<b>'+r.deleted.length+' file(s) verified here</b>'
+    +'<div class="muted" style="margin-top:6px">'+r.deleted.join(', ')+'</div>';
+  if(r.kept?.length) h+='<p style="color:var(--orange)"><b>'+r.kept.length+' KEPT</b> — '
+    +'no verified copy here:<br><span class="muted">'+r.kept.join(', ')+'</span></p>';
+  if(r.errors?.length) h+='<p style="color:var(--red)">'+r.errors.join('<br>')+'</p>';
+  if(!r.deleted?.length){ h+='<p>Nothing can be safely deleted.</p>'; }
+  else{
+    h+='<p class="muted">Erases them from the camera. The copies here are untouched.</p>';
+    confirmBtn.hidden=false; confirmBtn.textContent='Delete';
+    confirmBtn.onclick=async()=>{
+      confirmBtn.disabled=true; dlgBody.innerHTML='Deleting...';
+      const q=await (await fetch('/api/wipe',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({commit:true})})).json();
+      dlgBody.innerHTML=q.ok?'<b style="color:var(--green)">Deleted '+q.deleted.length+' file(s).</b>'
+        :'<b style="color:var(--red)">Finished with problems</b><div class="muted">'
+         +(q.errors||[]).join('<br>')+'</div>';
+      confirmBtn.hidden=true; confirmBtn.disabled=false; refresh();
+    };
+  }
+  dlgBody.innerHTML=h;
+};
+
+refresh(); setInterval(()=>{ if(lb.hidden) refresh(); },3000);
+</script>
+</body>
+</html>
+"""
+
+PAGE = PAGE.replace("__ICON_INLINE__", ICON_INLINE).replace("__ICON_URI__", ICON_URI)
+
+
+def main() -> int:
+    from waitress import serve
+    port = int(os.environ.get("PORT", "80"))
+    THUMBS.mkdir(parents=True, exist_ok=True)
+    PROXY.mkdir(parents=True, exist_ok=True)
+    TMP.mkdir(parents=True, exist_ok=True)
+    print(f"camera-drive-web listening on :{port}", flush=True)
+    # Streams hold a thread for their whole life, so keep plenty spare.
+    serve(app, host="0.0.0.0", port=port, threads=12, channel_timeout=120)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

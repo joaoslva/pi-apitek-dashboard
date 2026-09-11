@@ -1,0 +1,35 @@
+[Unit]
+Description=camera-drive live view and camcorder (Aiptek live mode)
+After=local-fs.target sound.target
+
+[Service]
+Type=simple
+User=joao
+Group=joao
+SupplementaryGroups=video audio
+
+# /run is tmpfs and does not survive a reboot. Let systemd own the directory's
+# lifecycle rather than creating it ad hoc. Preserve=yes matters here: this
+# unit stops every time the camera is unplugged, and without it systemd would
+# delete /run/camera-drive and break camera-drive-web.
+RuntimeDirectory=camera-drive
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+ExecStartPre=+/bin/install -d -o joao -g joao -m 0755 /srv/camera-drive/video
+ExecStartPre=+/bin/install -d -o joao -g joao -m 0755 /srv/camera-drive/media/snapshots
+
+ExecStart=/usr/local/bin/camera-live
+
+Restart=no
+
+# KillMode=mixed is load-bearing. The default signals every process in the
+# unit, so ffmpeg dies at the same instant as this wrapper and never finalises
+# the Matroska file -- the tell is an output whose size is an exact MiB
+# boundary and which ffprobe calls "File ended prematurely".
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

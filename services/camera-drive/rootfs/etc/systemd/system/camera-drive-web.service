@@ -1,0 +1,60 @@
+[Unit]
+Description=camera-drive web gallery
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=joao
+Group=joao
+
+# /run is tmpfs and is wiped on every boot, so /run/camera-drive does NOT
+# survive a reboot. Naming it in ReadWritePaths alone made this unit fail at
+# 226/NAMESPACE ("Failed to set up mount namespacing") on every cold boot and
+# restart-loop forever -- it only ever worked because camera-live happened to
+# have created the directory earlier in the same session.
+#
+# RuntimeDirectory makes systemd create it (owned by User=) before the unit
+# starts and adds it to the writable set automatically. Preserve=yes stops it
+# being deleted when camera-live stops on camera unplug, which would otherwise
+# pull the directory out from under this service.
+RuntimeDirectory=camera-drive
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+ExecStartPre=+/bin/install -d -o joao -g joao -m 0755 /srv/camera-drive/thumbs
+
+ExecStart=/usr/local/bin/camera-drive-web
+Environment=PORT=80
+
+# Binding port 80 as a non-root user. Worth it: it means the phone just needs
+# the bare IP with no port suffix, which matters when you are squinting at a
+# screen on a beach.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Deliberately NOT setting CapabilityBoundingSet here. Restricting it to
+# CAP_NET_BIND_SERVICE also strips CAP_SETUID/CAP_SETGID, which sudo needs to
+# become root -- that silently breaks the wipe path with
+# "sudo: unable to change to root gid: Operation not permitted".
+
+Restart=always
+RestartSec=3
+
+# Thumbnailing a big AVI on a Zero 2 W should not starve an in-flight offload.
+Nice=10
+
+# Modest hardening. The app only ever reads media and shells out to sudo.
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=strict
+# BOTH paths are required. ProtectSystem=strict makes the entire hierarchy
+# read-only apart from what is listed here, so omitting /run/camera-drive
+# leaves the camera control channel unwritable and every shutter or record
+# press fails with "Read-only file system: /run/camera-drive/control.tmp".
+# /run/camera-drive is NOT listed here on purpose -- RuntimeDirectory above
+# already makes it writable, and naming a path that may not exist yet is what
+# broke cold boots.
+ReadWritePaths=/srv/camera-drive
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

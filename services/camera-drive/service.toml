@@ -1,0 +1,37 @@
+id          = "camera-drive"
+title       = "Camera"
+description = "Photos and tapes offloaded from the Aiptek, and its live view"
+icon        = "camera"
+
+[route]
+prefix       = "/camera/"
+# Target after Phase 4. Until then the app still listens on 0.0.0.0:80.
+upstream     = "http://127.0.0.1:8081"
+strip_prefix = true
+
+[run]
+# camera-live and camera-offload@ stay udev-triggered: offloading must work
+# with the web app off, and stopping the app must not cut a recording.
+units         = ["camera-drive-web.service"]
+ready_path    = "/api/state"
+start_timeout = "30s"
+auto          = true
+idle_stop     = "20m"
+exclusive     = ["foreground"]
+
+[memory]
+# Measured ~37 MB RSS idle; thumbnailing and zip downloads add to that.
+budget = "60M"
+max    = "150M"
+
+[access]
+level = "use"
+
+[[access.rules]]
+path  = "/api/wipe"
+level = "admin"
+
+# Power off moves to the platform (owner only) in Phase 4.
+[[access.rules]]
+path  = "/api/power"
+level = "deny"

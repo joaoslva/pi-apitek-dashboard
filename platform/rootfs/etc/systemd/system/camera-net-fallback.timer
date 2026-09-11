@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically check camera-drive network reachability
+
+[Timer]
+# Wait a bit after boot so NetworkManager gets its own chance to autoconnect
+# before we start second-guessing it.
+OnBootSec=75s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

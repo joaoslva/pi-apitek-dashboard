@@ -1,0 +1,85 @@
+#!/bin/bash
+#
+# Keep the Pi reachable no matter where it is.
+#
+#   - If it can join a known WiFi network, it does. (Home, or wherever you
+#     have added credentials.)
+#   - If it cannot, it brings up its own access point so a phone can still
+#     reach the gallery.
+#   - If it is running its own access point and a known network reappears,
+#     it goes back to being a client.
+#
+# Deliberately NOT a one-way switch to AP mode. A device that can only ever
+# be its own island is a device you cannot update, and one failed boot away
+# from needing the SD card pulled.
+#
+# Run every minute by camera-net-fallback.timer.
+
+set -uo pipefail
+
+IFACE="${IFACE:-wlan0}"
+AP_CON="${AP_CON:-camera-drive-ap}"
+LOG=/srv/camera-drive/net.log
+
+log() { echo "$(date -Is) $*" >> "$LOG" 2>/dev/null; }
+
+command -v nmcli >/dev/null || exit 0
+
+# Every wifi profile except the access point one -- these are the networks we
+# would rather be on.
+mapfile -t CLIENT_CONS < <(
+  nmcli -t -f NAME,TYPE connection show \
+    | awk -F: '$2=="802-11-wireless"{print $1}' \
+    | grep -vxF "$AP_CON"
+)
+
+active="$(nmcli -t -f NAME,DEVICE connection show --active \
+          | awk -F: -v d="$IFACE" '$2==d{print $1}' | head -1)"
+
+# --- already on a real network: nothing to do -----------------------------
+if [ -n "$active" ] && [ "$active" != "$AP_CON" ]; then
+  exit 0
+fi
+
+# --- currently self-hosting: look for a known network to rejoin -----------
+if [ "$active" = "$AP_CON" ]; then
+  # Scanning while running an AP is unreliable on a single radio, so this may
+  # legitimately find nothing. That is fine -- we simply stay an AP.
+  visible="$(nmcli -t -f SSID device wifi list --rescan yes 2>/dev/null | sed '/^$/d')"
+  [ -z "$visible" ] && exit 0
+
+  for con in "${CLIENT_CONS[@]}"; do
+    ssid="$(nmcli -t -g 802-11-wireless.ssid connection show "$con" 2>/dev/null)"
+    [ -z "$ssid" ] && continue
+    if grep -qxF "$ssid" <<< "$visible"; then
+      log "known network '$ssid' is back, leaving AP mode"
+      nmcli connection down "$AP_CON" >/dev/null 2>&1
+      sleep 2
+      if nmcli connection up "$con" >/dev/null 2>&1; then
+        log "rejoined $ssid"
+        exit 0
+      fi
+      log "failed to rejoin $ssid, returning to AP"
+      nmcli connection up "$AP_CON" >/dev/null 2>&1
+      exit 0
+    fi
+  done
+  exit 0
+fi
+
+# --- nothing is up: try the known networks, then fall back to the AP ------
+for con in "${CLIENT_CONS[@]}"; do
+  if nmcli connection up "$con" >/dev/null 2>&1; then
+    log "joined $con"
+    exit 0
+  fi
+done
+
+if nmcli -t -f NAME connection show | grep -qxF "$AP_CON"; then
+  log "no known network reachable, starting access point"
+  nmcli connection up "$AP_CON" >/dev/null 2>&1 \
+    && log "access point up" \
+    || log "FAILED to start access point"
+else
+  log "no access point profile exists; run setup-ap.sh from the laptop"
+fi
