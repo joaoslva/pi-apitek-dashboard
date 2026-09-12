@@ -12,7 +12,7 @@
 #   component    "platform" or a services/ folder name; default: all of them
 #   --list       print what each component ships, touch nothing
 #   --check      show what differs on the Pi, change nothing
-#   --no-reload  install without reloading systemd and udev
+#   --no-reload  install without reloading systemd, udev, users or firewall
 #
 #   PI=joao@10.42.0.1 platform/deploy.sh
 
@@ -80,20 +80,54 @@ if [ "$MODE" = list ]; then
 fi
 
 echo "==> target: $PI ($MODE: ${components[*]})"
-STAGE="$(ssh "${SSH_OPTS[@]}" "$PI" mktemp -d /tmp/pms-deploy.XXXXXX)" || die "cannot reach $PI"
-trap 'ssh "${SSH_OPTS[@]}" "$PI" rm -rf "$STAGE" || true' EXIT
+OUT="$(mktemp)"
+STAGE="$(ssh "${SSH_OPTS[@]}" "$PI" mktemp -d /tmp/pms-deploy.XXXXXX)" || { rm -f "$OUT"; die "cannot reach $PI"; }
+trap 'rm -f "$OUT"; ssh "${SSH_OPTS[@]}" "$PI" rm -rf "$STAGE" || true' EXIT
 
 srcs=()
 for r in "${roots[@]}"; do srcs+=("$r/"); done
 rsync -rlpt --exclude=__pycache__ -e "ssh $(printf '%q ' "${SSH_OPTS[@]}")" "${srcs[@]}" "$PI:$STAGE/"
 
-ssh "${SSH_OPTS[@]}" "$PI" sudo -n bash -s -- "$STAGE" "$MODE" "$RELOAD" <<'REMOTE'
+ssh "${SSH_OPTS[@]}" "$PI" sudo -n bash -s -- "$STAGE" "$MODE" "$RELOAD" <<'REMOTE' |
 set -euo pipefail
 S=$1 MODE=$2 RELOAD=$3
+
+if [ -f "$S/etc/nftables.conf" ]; then
+  nft -c -f "$S/etc/nftables.conf" || { echo "  nftables.conf does not load; nothing installed" >&2; exit 1; }
+fi
+
+# An old deploy left /, /etc and /usr owned by joao and group-writable, which
+# hands root to anything running as that user. Every directory above a
+# deployed file must be owned by root and not writable by group or others.
+declare -A seen=()
+dirs=0
+check_parents() {
+  local d was
+  d="$(dirname "$1")"
+  while :; do
+    if [ -z "${seen[$d]+x}" ]; then
+      seen[$d]=1
+      if [ -d "$d" ] && [ -n "$(find "$d" -maxdepth 0 \( ! -user root -o -perm /022 ! -perm -1000 \) -print)" ]; then
+        was="$(stat -c '%a %U:%G' "$d")"
+        if [ "$MODE" = check ]; then
+          printf '  unsafe dir %-52s %s\n' "$d" "$was"
+        else
+          [ "$(stat -c %U "$d")" = root ] || chown root:root "$d"
+          chmod go-w "$d"
+          printf '  fixed dir  %-52s was %s\n' "$d" "$was"
+        fi
+        dirs=$((dirs + 1))
+      fi
+    fi
+    [ "$d" = / ] && break
+    d="$(dirname "$d")"
+  done
+}
 
 changed=()
 while IFS= read -r -d '' f; do
   dest="${f#"$S"}"
+  check_parents "$dest"
   if [ -x "$f" ]; then want=755; else want=644; fi
 
   if [ ! -e "$dest" ]; then
@@ -118,8 +152,8 @@ while IFS= read -r -d '' f; do
   changed+=("$dest")
 done < <(find "$S" -type f -print0 | sort -z)
 
-[ ${#changed[@]} -gt 0 ] || { echo "  everything up to date"; exit 0; }
-[ "$MODE" = install ] && [ "$RELOAD" = 1 ] || exit 0
+[ ${#changed[@]} -gt 0 ] || [ "$dirs" -gt 0 ] || { echo "  everything up to date"; exit 0; }
+[ "$MODE" = install ] && [ "$RELOAD" = 1 ] && [ ${#changed[@]} -gt 0 ] || exit 0
 
 if printf '%s\n' "${changed[@]}" | grep -q '^/etc/systemd/'; then
   systemctl daemon-reload
@@ -131,6 +165,29 @@ if printf '%s\n' "${changed[@]}" | grep -q '^/etc/udev/'; then
   udevadm trigger --subsystem-match=block --action=add >/dev/null 2>&1 || true
   echo "==> udev rules reloaded"
 fi
+if printf '%s\n' "${changed[@]}" | grep -q '^/etc/sysusers\.d/'; then
+  systemd-sysusers
+  echo "==> system users created"
+fi
+if printf '%s\n' "${changed[@]}" | grep -qx /etc/nftables.conf && systemctl is-active -q nftables.service; then
+  # A wrong ruleset can cut this very connection. Arm the removal of our
+  # table first; the laptop cancels it from a fresh SSH connection.
+  systemctl stop pms-firewall-revert.timer pms-firewall-revert.service 2>/dev/null || true
+  systemctl reset-failed pms-firewall-revert.service 2>/dev/null || true
+  systemd-run -q --unit=pms-firewall-revert --on-active=2min /usr/sbin/nft destroy table inet pms
+  systemctl reload nftables.service
+  echo "==> firewall reloaded, reverts in 2 min unless confirmed"
+  echo "@@firewall-armed@@"
+fi
 REMOTE
+tee "$OUT" | sed '/^@@firewall-armed@@$/d'
+
+if grep -qx '@@firewall-armed@@' "$OUT"; then
+  if ssh "${SSH_OPTS[@]}" "$PI" sudo -n systemctl stop pms-firewall-revert.timer; then
+    echo "==> firewall confirmed from a new SSH connection"
+  else
+    die "cannot reconnect after the firewall reload; the Pi drops table inet pms within 2 minutes"
+  fi
+fi
 
 echo "==> done"
