@@ -20,7 +20,8 @@ for playback with sound and a seek bar. Note that re-encoding is only slow in
 the LIVE capture path (a quarter of realtime); from a file the Pi's hardware
 encoder manages 3.3x realtime.
 
-Served by waitress on port 80 so the Pi is reachable at a bare IP from a phone.
+Served by waitress on 127.0.0.1:8081. Only pms-gateway reaches it, on :8444,
+after it has checked the visitor's session and access rules.
 """
 
 from __future__ import annotations
@@ -1031,13 +1032,16 @@ PAGE = PAGE.replace("__ICON_INLINE__", ICON_INLINE).replace("__ICON_URI__", ICON
 
 def main() -> int:
     from waitress import serve
-    port = int(os.environ.get("PORT", "80"))
+    # Loopback only: the gateway is the way in. Never 0.0.0.0, which would
+    # let anyone on the network skip the login.
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8081"))
     THUMBS.mkdir(parents=True, exist_ok=True)
     PROXY.mkdir(parents=True, exist_ok=True)
     TMP.mkdir(parents=True, exist_ok=True)
-    print(f"camera-drive-web listening on :{port}", flush=True)
+    print(f"camera-drive-web listening on {host}:{port}", flush=True)
     # Streams hold a thread for their whole life, so keep plenty spare.
-    serve(app, host="0.0.0.0", port=port, threads=12, channel_timeout=120)
+    serve(app, host=host, port=port, threads=12, channel_timeout=120)
     return 0
 
 

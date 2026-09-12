@@ -100,8 +100,9 @@ pending. Next: Phase 3.
 
 **camera-drive**
 - Stays Python for now. Move to `services/camera-drive/`.
-- Make the page prefix-aware (it uses absolute URLs: `/api/state`, `/thumb/…`,
-  `/media/…`), bind `127.0.0.1:8081`, drop `CAP_NET_BIND_SERVICE`.
+- Binds `127.0.0.1:8081` without `CAP_NET_BIND_SERVICE` (done in Phase 2);
+  reached only through the gateway on :8444. With a port per service the page
+  keeps its absolute URLs; no prefix support needed.
 - Power off moves to the platform (owner only); wipe becomes owner/admin only.
 - The udev-triggered offload keeps working independently of the web app state.
 
@@ -190,20 +191,25 @@ pi-mobile-server/
      grant), strips the gateway cookie both ways, `X-Forwarded-*` and
      `X-Pms-User`/`X-Pms-Level` set, immediate flush for streams, friendly
      502 when the service is down (starting it is Phase 3).
-   - Port 80 redirect is off until Phase 4 frees port 80 from camera-drive;
-     until then the camera upstream is its current `127.0.0.1:80`.
+   - Port 80: the gateway only redirects to https. camera-drive-web moved to
+     `127.0.0.1:8081` in this phase (pulled forward from Phase 4) after the
+     owner found `http://<ip>/` served the camera app past the login.
    - Deployed 2026-09-12: 8 tests pass (paths, rules, origin, next URL,
      passwords, proxy incl. cookie stripping and websockets, login + rate
      limit + CSRF); 12.9 MB binary; 25 MB RAM on the Pi; `systemd-analyze
      security` 1.5; enabled at boot. Signed out, 8443/8444 redirect to login.
      Details in `gateway/README.md`.
-   - Until Phase 4 the camera app is still reachable directly on port 80,
-     bypassing the gateway.
+   - Bug found by the owner's first sign-in: pages sent
+     `Referrer-Policy: no-referrer`, so browsers posted forms with
+     `Origin: null` and the cross-origin check refused the login. Now
+     `Sec-Fetch-Site` is checked first (Origin only as fallback) and the
+     policy is `same-origin`; regression test added.
 3. **Service manager** — start/stop via systemd, off/on/auto, budgets and
    exclusive groups, "starting…" page, all-off at boot, stop-all on shutdown,
    profiles.
-4. **camera-drive behind the gateway** — prefix-aware page, localhost bind,
-   owner-only destructive actions.
+4. **camera-drive behind the gateway** — owner-only destructive actions and
+   power off moved to the platform. (Localhost bind done in Phase 2; no
+   prefix work needed with a port per service.)
 5. **Etherpad bundle** — laptop build script, hardened unit, behind `/pad/`,
    Meeting profile.
 6. **Network modes** — Island default, Join with confirm-or-revert, watchdog,
@@ -259,6 +265,11 @@ tables, so only `table inet pms` is ever replaced; a deploy that copies a
 rootfs tree onto `/` with ownership preserved hands the system directories to
 the laptop user; `passwd -S` showing `NP` means an empty password; a bash
 `until` loop returns its body's last status, not the condition's.
+
+From Phase 2: `Referrer-Policy: no-referrer` makes a page's own form posts
+send `Origin: null`, so an Origin-equality CSRF check refuses them — check
+`Sec-Fetch-Site` first; unit tests that set headers by hand do not catch
+browser behaviour like this.
 
 From 2026-09-11: NM keyfiles must be mode 600; the duplicate netplan profile will
 autoconnect on any free WiFi interface; memory cgroup off by default; the

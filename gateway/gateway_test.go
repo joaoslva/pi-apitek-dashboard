@@ -131,6 +131,16 @@ func TestOriginOK(t *testing.T) {
 	if originOK(req("POST", "", "same-site")) {
 		t.Error("same-site but cross-origin POST should be refused")
 	}
+	// What a browser sends for a form on a no-referrer page: Origin null.
+	if !originOK(req("POST", "null", "same-origin")) {
+		t.Error("same-origin POST with Origin: null should pass on Sec-Fetch-Site")
+	}
+	if originOK(req("POST", "https://pocketserver:8443", "cross-site")) {
+		t.Error("Sec-Fetch-Site cross-site should win over a matching Origin")
+	}
+	if originOK(req("POST", "null", "")) {
+		t.Error("Origin: null without Sec-Fetch-Site should be refused")
+	}
 	ws := req("GET", "https://pocketserver:8444", "")
 	ws.Header.Set("Connection", "keep-alive, Upgrade")
 	ws.Header.Set("Upgrade", "websocket")

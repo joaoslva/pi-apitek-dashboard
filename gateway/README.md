@@ -8,6 +8,7 @@ binary with its pages embedded; the pages use no JavaScript.
   your account; for the owner also Users and Audit log
 - `https://<pi>:<route.port>/` — each service, behind the same session,
   proxied to its loopback upstream. Etherpad is 8443, the camera 8444.
+- `http://<pi>/` — only redirects to `https://<pi>/` (`redirect_http`)
 
 ## Build and deploy
 
@@ -64,8 +65,11 @@ at the configured paths, readable by `pms-gateway`, and restart the service.
   separate origin: script in one service cannot read or submit the gateway's
   pages. The session cookie (`__Host-pms`, HttpOnly, Secure, SameSite=Lax) is
   still sent to every port, so the proxy removes it from requests, drops any
-  `Set-Cookie` for it in responses, and requires non-GET requests and websocket
-  upgrades to carry an `Origin` equal to their own port's origin.
+  `Set-Cookie` for it in responses, and refuses non-GET requests and websocket
+  upgrades from any other origin: `Sec-Fetch-Site` must be `same-origin` (or
+  `none`); browsers without it must send an `Origin` equal to the port's own.
+  Pages use `Referrer-Policy: same-origin` — `no-referrer` would make their
+  own form posts send `Origin: null`.
 - **Access.** No grant means 404 on the whole port and no menu entry. Rules from
   `service.toml` are checked on every request, including websocket upgrades;
   see `services/README.md`. Ambiguous paths (`..`, `//`, encoded `/`) are

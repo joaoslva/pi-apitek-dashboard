@@ -4,9 +4,8 @@
 # Login, portal and admin. Services listen on the route.port in their manifest.
 listen = ":443"
 
-# Plain-HTTP listener that redirects to https. Empty until Phase 4 moves
-# camera-drive off port 80; then ":80".
-redirect_http = ""
+# Plain-HTTP listener that only redirects to https. Empty disables it.
+redirect_http = ":80"
 
 # service.toml files, installed by `platform/deploy.sh gateway`.
 services_dir = "/etc/pms/services"

@@ -26,9 +26,13 @@ tell which mode you plugged in as and react accordingly.
 
 ## Getting to it
 
-- On a known WiFi network: `http://pocketserver.local/` (or its IP; the host
+Through the gateway only: sign in at `https://<pi>/` and pick Camera, or go
+straight to `https://<pi>:8444/`. The app itself listens on `127.0.0.1:8081`;
+plain `http://<pi>/` now just redirects to the gateway.
+
+- On a known WiFi network: `https://pocketserver.local/` (or its IP; the host
   was `cameradrive` before Phase 1)
-- With no network around: the Pi raises its own AP, then `http://10.42.0.1/`
+- With no network around: the Pi raises its own AP, then `https://10.42.0.1/`
 
 It switches between the two by itself, checking once a minute. It prefers being
 a normal client; the AP is the fallback. See `camera-net-fallback`.
@@ -54,7 +58,8 @@ The Pi is almost certainly fine — check the phone first, in this order:
    `10.42.0.1` into a path that no longer exists. This is the one that caught us.
 2. **Mobile data.** A WiFi network with no internet makes phones quietly send
    everything over cellular. Tell it to stay connected, or turn data off.
-3. Type `http://` explicitly so the browser does not try HTTPS or a search.
+3. Type the address with a scheme so the browser does not run a search. (Before
+   the gateway this said `http://`; `http://` still works, it redirects.)
 
 To confirm which side was at fault without a phone, a one-off `ap-diag.sh`
 dropped the Pi to AP mode, curled its own address and logged `ip addr`, the

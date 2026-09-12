@@ -5,9 +5,7 @@ icon        = "camera"
 
 [route]
 port     = 8444
-# The app still listens on 0.0.0.0:80 itself until Phase 4 moves it to
-# 127.0.0.1:8081 and gives port 80 to the gateway's https redirect.
-upstream = "http://127.0.0.1:80"
+upstream = "http://127.0.0.1:8081"
 
 [run]
 # camera-live and camera-offload@ are started by udev when the camera is

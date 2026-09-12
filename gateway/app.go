@@ -241,18 +241,22 @@ func (a *App) validNext(r *http.Request, next string) string {
 
 // originOK refuses state-changing requests and websocket upgrades sent from
 // another origin, which includes another service port on the same host.
-// Clients that send neither Origin nor Sec-Fetch-Site are not browsers, and
-// cannot be made to carry someone else's cookie.
+//
+// Sec-Fetch-Site comes first: browsers set it and pages cannot. Origin is the
+// fallback for older browsers, and is not reliable alone: a page with
+// Referrer-Policy no-referrer makes its own form posts send "Origin: null".
+// Clients that send neither are not browsers, and cannot be made to carry
+// someone else's cookie.
 func originOK(r *http.Request) bool {
 	safe := r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
 	if safe && !isUpgrade(r) {
 		return true
 	}
-	if o := r.Header.Get("Origin"); o != "" {
-		return strings.EqualFold(o, "https://"+r.Host)
-	}
 	if s := r.Header.Get("Sec-Fetch-Site"); s != "" {
 		return s == "same-origin" || s == "none"
+	}
+	if o := r.Header.Get("Origin"); o != "" {
+		return strings.EqualFold(o, "https://"+r.Host)
 	}
 	return true
 }
@@ -335,7 +339,8 @@ func (a *App) pageHeaders(w http.ResponseWriter, r *http.Request) {
 	h.Set("Content-Security-Policy", "default-src 'none'; style-src "+gw+"; form-action "+
 		strings.Join(actions, " ")+"; frame-ancestors 'none'; base-uri 'none'")
 	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("Referrer-Policy", "no-referrer")
+	// Not no-referrer: that turns the Origin of our own form posts into "null".
+	h.Set("Referrer-Policy", "same-origin")
 	h.Set("Cross-Origin-Opener-Policy", "same-origin")
 	h.Set("Cache-Control", "no-store")
 }
