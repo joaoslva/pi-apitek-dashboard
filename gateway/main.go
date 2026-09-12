@@ -198,6 +198,14 @@ func cmdCheck(args []string) error {
 	for _, m := range services {
 		fmt.Printf("  %-14s :%d -> %s  units=%v\n", m.ID, m.Route.Port, m.Route.Upstream, m.Run.Units)
 	}
+	// Asks logind without doing anything; run as pms-gateway to test polkit.
+	for _, action := range []string{"poweroff", "reboot"} {
+		answer, err := logindCan(action)
+		if err != nil {
+			answer = "unknown: " + err.Error()
+		}
+		fmt.Printf("  %s allowed for this user: %s\n", action, answer)
+	}
 	return nil
 }
 

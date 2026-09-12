@@ -37,6 +37,7 @@ type App struct {
 	ipLimit     *limiter // failed logins per client IP
 	pairLimit   *limiter // failed logins per client IP + username
 	now         func() time.Time
+	power       func(action string) error // logindPower; replaced in tests
 
 	mu    sync.Mutex
 	cache map[string]*cachedSession
@@ -80,6 +81,7 @@ func newApp(cfg *Config, st *Store, services []*Manifest) (*App, error) {
 		ipLimit:     newLimiter(20, 15*time.Minute),
 		pairLimit:   newLimiter(5, 15*time.Minute),
 		now:         time.Now,
+		power:       logindPower,
 		cache:       map[string]*cachedSession{},
 	}, nil
 }

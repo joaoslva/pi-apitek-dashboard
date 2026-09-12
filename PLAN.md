@@ -207,8 +207,9 @@ pi-mobile-server/
 3. **Service manager** — start/stop via systemd, off/on/auto, budgets and
    exclusive groups, "starting…" page, all-off at boot, stop-all on shutdown,
    profiles.
-4. **camera-drive behind the gateway** — owner-only destructive actions and
-   power off moved to the platform. (Localhost bind done in Phase 2; no
+4. **camera-drive behind the gateway** — owner-only destructive actions; remove
+   the camera app's own power-off (already `deny` in its manifest). (Localhost
+   bind and an owner Shut down / Restart on the portal done in Phase 2; no
    prefix work needed with a port per service.)
 5. **Etherpad bundle** — laptop build script, hardened unit, behind `/pad/`,
    Meeting profile.

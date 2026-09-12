@@ -23,6 +23,7 @@ func (a *App) gatewayHandler() http.Handler {
 	mux.HandleFunc("GET /admin/audit", a.withOwner(a.handleAudit))
 	mux.HandleFunc("POST /admin/users", a.withOwner(a.handleCreateUser))
 	mux.HandleFunc("POST /admin/users/{name}/{action}", a.withOwner(a.handleUserAction))
+	mux.HandleFunc("POST /admin/power/{action}", a.withOwner(a.handlePower))
 	mux.Handle("GET /static/", http.FileServerFS(a.static))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		a.renderError(w, r, http.StatusNotFound, "There is nothing here.")
@@ -232,6 +233,34 @@ func (a *App) handleOwnPassword(w http.ResponseWriter, r *http.Request, s *Sessi
 	clearCookie(w)
 	a.audit(r, u.Name, "password-changed", "")
 	http.Redirect(w, r, "/login?ok=changed", http.StatusSeeOther)
+}
+
+type powerData struct{ Heading, Message string }
+
+// handlePower shuts the Pi down or restarts it, for the owner only.
+func (a *App) handlePower(w http.ResponseWriter, r *http.Request, s *Session) {
+	action := r.PathValue("action")
+	var page powerData
+	switch action {
+	case "poweroff":
+		page = powerData{"Shutting down", "Wait until the green light on the Pi has stopped flashing, about 20 seconds, before unplugging it."}
+	case "reboot":
+		page = powerData{"Restarting", "The Pi is back in about half a minute. This page does not reload by itself."}
+	default:
+		a.renderError(w, r, http.StatusNotFound, "There is nothing here.")
+		return
+	}
+	if r.PostFormValue("confirm") != "yes" {
+		a.renderError(w, r, http.StatusBadRequest, "Tick “I'm sure” to confirm.")
+		return
+	}
+	a.audit(r, s.User.Name, "power-"+action, "")
+	if err := a.power(action); err != nil {
+		slog.Error("power", "action", action, "err", err)
+		a.renderError(w, r, http.StatusInternalServerError, "The Pi refused: "+err.Error())
+		return
+	}
+	a.render(w, r, http.StatusOK, "power", view{Title: page.Heading, Data: page})
 }
 
 type grantRow struct{ ID, Title, Level string }
