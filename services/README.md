@@ -23,9 +23,8 @@ description = "One line under the title"
 icon        = "camera"            # name from the gateway's embedded icon set
 
 [route]
-prefix       = "/camera/"               # public path, must start and end with /
-upstream     = "http://127.0.0.1:8081"  # loopback only
-strip_prefix = true                     # upstream sees /x for /camera/x
+port     = 8444                     # public HTTPS port, 8443-8450 (the firewall opens that range)
+upstream = "http://127.0.0.1:8081"  # loopback only, no path
 
 [run]
 units         = ["camera-drive-web.service"]  # started in order, stopped in reverse
@@ -40,7 +39,7 @@ budget = "60M"    # expected peak; admission refuses a start that does not fit
 max    = "150M"   # systemd MemoryMax= (needs cgroup_enable=memory)
 
 [access]
-level = "use"     # minimum level for anything under the prefix
+level = "use"     # minimum level for anything on this service
 
 [[access.rules]]
 path    = "/api/wipe"   # this path and everything below it
@@ -58,13 +57,26 @@ Sizes use systemd suffixes (`K`, `M`, `G`, binary). Durations use Go syntax
 - A user's grant for a service is `use` or `admin`. The owner holds every level
   on every service. `deny` matches nobody, including the owner.
 - A user without a grant does not see the service in the menu, and gets a 404
-  for every path under its prefix.
-- The gateway normalises the request path before matching and rejects
-  anything ambiguous (encoded `/` or `\`, `..` segments, repeated slashes).
+  for every path on its port.
+- The gateway rejects ambiguous request paths before matching (encoded `/`,
+  `\` or NUL, `.` or `..` segments, repeated slashes).
 - Rules match whole segments: `/api/wipe` covers `/api/wipe/x` but not
-  `/api/wipes`. The longest matching rule wins; `[access] level` applies when
-  none match. A rule with `methods` only matches those methods.
-- Websocket upgrades are checked like any other request.
+  `/api/wipes`. Matching ignores case, because some upstreams route `/ADMIN`
+  like `/admin` (Express does). The longest matching rule wins, a rule with
+  `methods` beats one without at the same path, and `[access] level` applies
+  when none match. `HEAD` counts as `GET`.
+- Websocket upgrades are checked like any other request, and must come from
+  the service's own origin, as must every non-GET request.
+
+### What the upstream sees
+
+- The request as the browser sent it, at the root of the service: no prefix.
+- `Host` as the browser sent it; `X-Forwarded-For`, `-Host`, `-Proto`.
+- `X-Pms-User` (username) and `X-Pms-Level` (`use`, `admin` or `owner`), set by
+  the gateway; anything the client sent under `X-Pms-` is removed.
+- Never the gateway's session cookie, and any `Set-Cookie` for it in the
+  response is dropped. Other cookies pass through — and browsers share cookies
+  between ports of one host, so services see each other's cookies.
 
 ### Exclusive groups
 

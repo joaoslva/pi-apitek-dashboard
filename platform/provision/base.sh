@@ -79,6 +79,17 @@ for u in ModemManager.service bluetooth.service; do
   fi
 done
 
+step "gateway"
+if [ -e /etc/systemd/system/pms-gateway.service ]; then
+  if ! systemctl is-enabled -q pms-gateway.service; then
+    systemctl enable -q pms-gateway.service
+    did "pms-gateway enabled at boot"
+  fi
+  did "pms-gateway is $(systemctl is-active pms-gateway.service)"
+else
+  did "not deployed yet: platform/deploy.sh gateway, then run this again"
+fi
+
 step "leftovers from the SD card recovery"
 # netreport sleeps 45 s inside a oneshot, holding boot open for ~50 s.
 if [ -e /etc/systemd/system/netreport.service ]; then

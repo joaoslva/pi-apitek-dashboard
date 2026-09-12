@@ -4,6 +4,7 @@ backups/
 # Build output
 dist/
 build/
+gateway/rootfs/usr/local/bin/pms-gateway
 
 # Python
 __pycache__/
