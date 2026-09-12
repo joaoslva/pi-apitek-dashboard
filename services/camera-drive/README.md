@@ -26,7 +26,8 @@ tell which mode you plugged in as and react accordingly.
 
 ## Getting to it
 
-- On a known WiFi network: `http://cameradrive.local/` (or its IP)
+- On a known WiFi network: `http://pocketserver.local/` (or its IP; the host
+  was `cameradrive` before Phase 1)
 - With no network around: the Pi raises its own AP, then `http://10.42.0.1/`
 
 It switches between the two by itself, checking once a minute. It prefers being
@@ -55,11 +56,11 @@ The Pi is almost certainly fine — check the phone first, in this order:
    everything over cellular. Tell it to stay connected, or turn data off.
 3. Type `http://` explicitly so the browser does not try HTTPS or a search.
 
-To confirm which side is at fault without a phone at all, run
-`/usr/local/sbin/ap-diag.sh` on the Pi: it drops to AP mode, curls its own
-address, dumps `ip addr`, the listening sockets and the firewall ruleset to
-`/srv/camera-drive/apdiag.log`, and a separately armed timer restores the WiFi
-afterwards. Always arm the revert timer BEFORE breaking the network.
+To confirm which side was at fault without a phone, a one-off `ap-diag.sh`
+dropped the Pi to AP mode, curled its own address and logged `ip addr`, the
+listening sockets and the firewall ruleset, while a separately armed timer
+restored the WiFi. It was removed in Phase 1; the lesson stays: always arm the
+revert timer BEFORE breaking the network.
 
 ## What is on the Pi
 
@@ -69,7 +70,6 @@ afterwards. Always arm the revert timer BEFORE breaking the network.
 /usr/local/bin/camera-live         owns the camera in live mode: preview + recording
 /usr/local/bin/camera-drive-web    the phone-facing gallery (unprivileged)
 /usr/local/bin/camera-net-fallback keeps the Pi reachable
-/usr/local/sbin/netreport.sh       dumps network state to the boot partition each boot
 
 /srv/camera-drive/media/           offloaded photos, in timestamped folders
 /srv/camera-drive/media/snapshots/ photos taken from the phone
@@ -247,14 +247,15 @@ two clocks without costing frames.
 
 ## Recovering a Pi that will not come up
 
-`netreport.service` writes `/boot/firmware/netreport.txt` about 45 seconds into
-every boot — IP, WiFi state, visible SSIDs, rfkill, regulatory domain, whether
-sshd is listening, and the NetworkManager journal. That partition is vfat, so
-pull the card, put it in any machine, and read the file. No mounting the root
-filesystem, no sudo, no guessing.
-
 `platform/provision/fix-pi-card.sh` re-applies the user, SSH key, WiFi profile and service symlinks
 directly to the root partition from a laptop, bypassing cloud-init entirely.
+
+It also installs `netreport.service`, which writes `/boot/firmware/netreport.txt`
+about 45 seconds into every boot — IP, WiFi state, visible SSIDs, rfkill,
+regulatory domain, whether sshd is listening, and the NetworkManager journal.
+That partition is vfat, so pull the card, put it in any machine, and read the
+file. It holds boot open for those 45 seconds, so `platform/provision/base.sh`
+removes it once the Pi is reachable again.
 
 ## The thing that would make all of this unnecessary
 

@@ -1,0 +1,2 @@
+# The presence of this file stops cloud-init from running at boot. It
+# re-rendered /etc/hosts and a netplan WiFi profile on every boot.

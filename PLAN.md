@@ -4,7 +4,7 @@ A Raspberry Pi Zero 2 W as a pocket server: carry it to a meeting, switch it on,
 colleagues join its hotspot and use Etherpad through a login gateway. The
 existing camera-drive project becomes one service among several.
 
-Status: Phase 0 done (2026-09-11). Next: Phase 1.
+Status: Phase 1 done (2026-09-12). Next: Phase 2.
 
 ## Settled decisions
 
@@ -108,7 +108,7 @@ pi-mobile-server/
 ├── backups/                 # local data backups, never committed
 ├── platform/
 │   ├── README.md
-│   ├── provision/           # fill-secrets, fix-pi-card, diagnose, setup-ap, cloud-init templates
+│   ├── provision/           # base.sh; fill-secrets, fix-pi-card, diagnose, setup-ap, cloud-init templates
 │   ├── rootfs/              # files mirrored onto the Pi (units, nft, polkit, NM, zram…)
 │   └── deploy.sh            # --list / --check / install; platform + services/*/rootfs
 ├── gateway/                 # Go: auth, proxy, portal, admin, service + network manager
@@ -120,20 +120,40 @@ pi-mobile-server/
 
 ## Phases
 
-0. **Repo** — DONE 2026-09-11. `git init` (branch `main`, nothing committed
-   yet); camera-drive split into `services/camera-drive/` and `platform/`;
+0. **Repo** — DONE 2026-09-11. First commit `6c7aff8` on `main` (later
+   phases go through branches and PRs); camera-drive split into
+   `services/camera-drive/` and `platform/`;
    `__pycache__` removed; `service.toml` format in `services/README.md` with
    manifests for camera-drive and etherpad; `platform/deploy.sh` generalised
    (installs root:root 0644/0755, refuses duplicate paths and symlinks,
    `--check` is read-only). `--check` showed the Pi's file contents match the
    repo exactly.
-1. **Platform base** — disable cloud-init; delete duplicate NM profile
-   `netplan-wlan0-TP-LINK_8E4332`; disable ModemManager and bluetooth; stop
-   `netreport` holding boot open; `cgroup_enable=memory`; nftables ruleset;
-   gateway system user; polkit rules; hostname. First real deploy fixes
-   ownership: `/usr/local/bin/camera-*` are owned by `joao` on the Pi
-   (`camera-wipe` and `camera-offload` run as root) and units are 664 — must
-   happen before removing joao's NOPASSWD sudo.
+1. **Platform base** — DONE 2026-09-12. Files in `platform/rootfs/`, state in
+   `platform/provision/base.sh` (idempotent, re-run shows no changes).
+   - cloud-init off (`/etc/cloud/cloud-init.disabled`); its netplan WiFi
+     profile and `/etc/netplan/*.yaml` (plain-text password) deleted;
+     `/etc/hosts` no longer cloud-init managed.
+   - Hostname `pocketserver`. ModemManager and bluetooth disabled.
+     `netreport.service`, `ap-diag.sh` and a stale `__pycache__` removed.
+     Boot 1 min 24 s -> 21.5 s.
+   - `cgroup_enable=memory` added; `memory` controller active after reboot.
+   - nftables: table `inet pms`, input policy drop; 22/80/443, mDNS,
+     DHCPv6 replies, ICMP, DHCP+DNS on `wlan0`. A drop-in replaces the stock
+     `nft flush ruleset` on stop. Closed ports time out from the LAN.
+   - `pms-gateway` system user (sysusers.d, uid 985). Polkit lets it
+     start/stop/restart `camera-drive-web` and `etherpad` only, power off and
+     reboot, and NM network-control, modify.system, wifi.scan; everything
+     else is refused (tested: restart cron and stop ssh denied).
+   - Found and fixed: `/`, `/etc`, `/etc/systemd`, `/etc/udev`, `/usr`,
+     `/usr/local`, `/usr/local/bin` were `joao:joao 775` (a root escalation
+     for anything running as joao, e.g. camera-drive-web); camera binaries
+     `joao`-owned, units 664. `deploy.sh` now fixes and reports unsafe parent
+     directories.
+   - Found and fixed: `joao` had an empty password (console login and `su`
+     with none); now locked. Three identical NOPASSWD sudo files -> one,
+     `/etc/sudoers.d/010-joao`.
+   - `deploy.sh` also runs `systemd-sysusers`, and reloads a running firewall
+     behind a 2-minute revert timer that a fresh SSH connection cancels.
 2. **Gateway MVP** — TLS (self-signed), login, sessions, CSRF, rate limit,
    owner UI for users and grants, portal menu from `service.toml`, reverse
    proxy with websockets, audit log.
@@ -159,17 +179,23 @@ pi-mobile-server/
 | Swap | 416 MB zstd zram (rpi-swap) |
 | WiFi | BCM43430/1 family, firmware 7.45.96.s1, 2.4 GHz only; TP-Link on channel 1 |
 | Relay test | failed: `brcmf_configure_wpaie: wpa_auth error -52` (AP on uap0), `wl_set_wpa_version failed (-52)` (client on uap0), also with hotspot started first |
+| Boot | 21.5 s to multi-user after Phase 1 (was 1 min 24 s, 49 s of it netreport); ~250 MB available a minute after boot |
 | Storage | SanDisk 64 GB, ~4 GB used |
 | Software | NM 1.52, systemd 257, polkit 126, nftables (no rules), dnsmasq-base, Python 3.13, ffmpeg 7.1 |
 
 ## Working on the Pi
 
-- `ssh -i ~/.ssh/pi_camera_drive joao@192.168.1.206` — the laptop cannot
-  resolve `cameradrive.local`. The Pi's WiFi can miss the first ARP; retry.
+- `ssh -i ~/.ssh/pi_camera_drive joao@192.168.1.206` — hostname
+  `pocketserver` (was `cameradrive`), but the laptop cannot resolve `.local`
+  names. The Pi's WiFi can miss the first ARP; retry.
 - `platform/deploy.sh --check` shows drift between the repo and the Pi without
   changing anything; run it before and after deploying.
 - Non-login SSH PATH lacks `/usr/sbin` (`iw`, `NetworkManager`, `swapon`).
-- `joao` currently has passwordless sudo.
+- `joao` has passwordless sudo from one file, `/etc/sudoers.d/010-joao`, and a
+  locked password (SSH key only). `deploy.sh` needs `sudo -n`. Give joao a
+  password before ever removing NOPASSWD, or sudo is gone.
+- New card or recovered Pi: `platform/deploy.sh`, then `base.sh`, then reboot
+  (see `platform/README.md`).
 - Before anything that can break networking, arm a revert with
   `systemd-run --on-active=…` first.
 - Long jobs on the Pi run as `systemd-run` units so a dropped SSH cannot
@@ -185,7 +211,14 @@ supervisors; `[hidden]{display:none !important}` before display rules;
 cloud-init `instance-id` needs a hyphen; no RTC, so early boot logs carry old
 dates.
 
-From today: NM keyfiles must be mode 600; the duplicate netplan profile will
+From Phase 1: Debian's `nftables.conf` starts with `flush ruleset` and the
+unit's `ExecStop` flushes too — both would wipe NetworkManager's shared-mode
+tables, so only `table inet pms` is ever replaced; a deploy that copies a
+rootfs tree onto `/` with ownership preserved hands the system directories to
+the laptop user; `passwd -S` showing `NP` means an empty password; a bash
+`until` loop returns its body's last status, not the condition's.
+
+From 2026-09-11: NM keyfiles must be mode 600; the duplicate netplan profile will
 autoconnect on any free WiFi interface; memory cgroup off by default; the
 Etherpad plugin marker; the camera's hardware H.264 encoder draws from the CMA
 pool, so test `/api/mp4` before shrinking it.
