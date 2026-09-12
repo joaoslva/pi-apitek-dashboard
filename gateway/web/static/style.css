@@ -59,7 +59,11 @@ button.link { background: none; color: var(--accent); padding: 0; text-decoratio
 details { margin-top: .5rem; }
 summary { cursor: pointer; color: var(--muted); }
 form.inline { margin: .75rem 0 0; padding-top: .75rem; border-top: 1px solid var(--line); }
-.danger button { background: var(--warn); }
+.danger button, button.danger { background: var(--warn); }
+.power { margin-top: 1.5rem; }
+.power button + button { margin-left: .5rem; }
+label.check { display: flex; gap: .5rem; align-items: center; color: var(--fg); }
+label.check input { display: inline; width: auto; margin: 0; }
 
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: .9rem; }

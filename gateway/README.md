@@ -5,7 +5,9 @@ portal, owner administration and an authenticating reverse proxy. One Go
 binary with its pages embedded; the pages use no JavaScript.
 
 - `https://<pi>/` — sign in, the portal (only the services you were granted),
-  your account; for the owner also Users and Audit log
+  your account; for the owner also Users, Audit log, and Shut down / Restart
+  on the portal (an "I'm sure" tick, audited; logind over D-Bus, allowed by
+  polkit; `pms-gateway check` run as `pms-gateway` shows whether it would work)
 - `https://<pi>:<route.port>/` — each service, behind the same session,
   proxied to its loopback upstream. Etherpad is 8443, the camera 8444.
 - `http://<pi>/` — only redirects to `https://<pi>/` (`redirect_http`)

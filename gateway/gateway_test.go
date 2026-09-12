@@ -334,6 +334,63 @@ func TestProxy(t *testing.T) {
 	}
 }
 
+func TestPower(t *testing.T) {
+	app, _ := testApp(t, "http://127.0.0.1:9")
+	hash, _ := hashPassword("owner password")
+	if err := app.store.CreateUser("olivia", hash, true); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	app.power = func(action string) error { got = append(got, action); return nil }
+	srv := httptest.NewServer(app.gatewayHandler())
+	defer srv.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	owner, alice := sessionFor(t, app, "olivia"), sessionFor(t, app, "alice")
+
+	cases := []struct {
+		path, token, form string
+		want              int
+	}{
+		{"/admin/power/poweroff", alice, "csrf=csrf-token&confirm=yes", 404},
+		{"/admin/power/poweroff", owner, "csrf=csrf-token", 400},
+		{"/admin/power/poweroff", owner, "confirm=yes", 403},
+		{"/admin/power/explode", owner, "csrf=csrf-token&confirm=yes", 404},
+		{"/admin/power/reboot", owner, "csrf=csrf-token&confirm=yes", 200},
+		{"/admin/power/poweroff", owner, "csrf=csrf-token&confirm=yes", 200},
+	}
+	for _, c := range cases {
+		req, _ := http.NewRequest("POST", srv.URL+c.path, strings.NewReader(c.form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Cookie", cookieName+"="+c.token)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Errorf("POST %s %q: %d, want %d", c.path, c.form, resp.StatusCode, c.want)
+		}
+	}
+	if strings.Join(got, ",") != "reboot,poweroff" {
+		t.Errorf("power actions run: %v", got)
+	}
+
+	// The portal shows the power card to the owner only.
+	for token, want := range map[string]bool{owner: true, alice: false} {
+		req, _ := http.NewRequest("GET", srv.URL+"/", nil)
+		req.Header.Set("Cookie", cookieName+"="+token)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.Contains(string(body), "admin/power/poweroff") != want {
+			t.Errorf("power card shown=%v, want %v", !want, want)
+		}
+	}
+}
+
 func TestLoginFlow(t *testing.T) {
 	app, _ := testApp(t, "http://127.0.0.1:9")
 	srv := httptest.NewServer(app.gatewayHandler())

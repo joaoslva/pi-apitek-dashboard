@@ -32,6 +32,26 @@
 {{else}}
 <p class="muted">Nothing has been shared with you yet. Ask the owner for access.</p>
 {{end}}
+{{if .Session.User.Owner}}
+<section class="card narrow power">
+  <h2>This Pi</h2>
+  <form method="post" action="{{.Home}}admin/power/poweroff">
+    <input type="hidden" name="csrf" value="{{.Session.CSRF}}">
+    <label class="check"><input type="checkbox" name="confirm" value="yes" required> I'm sure</label>
+    <button class="danger">Shut down</button>
+    <button formaction="{{.Home}}admin/power/reboot">Restart</button>
+  </form>
+  <p class="muted">Every service stops cleanly first. Everyone connected loses access.</p>
+</section>
+{{end}}
+{{template "bottom" .}}{{end}}
+
+
+{{define "power"}}{{template "top" .}}
+<section class="card narrow">
+  <h1>{{.Data.Heading}}…</h1>
+  <p>{{.Data.Message}}</p>
+</section>
 {{template "bottom" .}}{{end}}
 
 

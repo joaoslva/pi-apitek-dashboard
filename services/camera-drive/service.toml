@@ -30,7 +30,7 @@ level = "use"
 path  = "/api/wipe"
 level = "admin"
 
-# Power off moves to the platform (owner only, in the gateway) in Phase 4.
+# Powering off is the owner's, from the gateway portal, not the camera app's.
 [[access.rules]]
 path  = "/api/power"
 level = "deny"
