@@ -40,7 +40,10 @@ for arg in "$@"; do
 done
 
 rootfs_of() {
-  if [ "$1" = platform ]; then echo "$REPO/platform/rootfs"; else echo "$REPO/services/$1/rootfs"; fi
+  case "$1" in
+    platform|gateway) echo "$REPO/$1/rootfs" ;;
+    *)                echo "$REPO/services/$1/rootfs" ;;
+  esac
 }
 
 # Paths relative to a rootfs, as they will appear on the Pi.
@@ -49,7 +52,7 @@ files_in() {
 }
 
 if [ ${#components[@]} -eq 0 ]; then
-  components=(platform)
+  components=(platform gateway)
   for d in "$REPO"/services/*/rootfs; do
     [ -d "$d" ] && components+=("$(basename "$(dirname "$d")")")
   done
@@ -60,6 +63,28 @@ for c in "${components[@]}"; do
   r="$(rootfs_of "$c")"
   [ -d "$r" ] || die "component '$c' has no rootfs ($r)"
   roots+=("$r")
+done
+
+# The gateway also carries every service manifest, since they are its
+# configuration: services/<id>/service.toml -> /etc/pms/services/<id>.toml
+MANIFESTS=""
+trap '[ -z "$MANIFESTS" ] || rm -rf "$MANIFESTS"' EXIT
+for c in "${components[@]}"; do
+  [ "$c" = gateway ] || continue
+  bin="$REPO/gateway/rootfs/usr/local/bin/pms-gateway"
+  if [ "$MODE" != list ]; then
+    [ -x "$bin" ] || die "the gateway is not built: run gateway/build.sh"
+    stale="$(find "$REPO/gateway" -path "$REPO/gateway/rootfs" -prune -o -type f \
+      \( -name '*.go' -o -name '*.html' -o -name '*.css' -o -name 'go.*' \) -newer "$bin" -print)"
+    [ -z "$stale" ] || die "gateway sources are newer than the binary: run gateway/build.sh\n$stale"
+  fi
+  MANIFESTS="$(mktemp -d)"
+  mkdir -p "$MANIFESTS/etc/pms/services"
+  for t in "$REPO"/services/*/service.toml; do
+    [ -f "$t" ] && install -m 644 "$t" "$MANIFESTS/etc/pms/services/$(basename "$(dirname "$t")").toml"
+  done
+  components+=(manifests)
+  roots+=("$MANIFESTS")
 done
 
 # Only regular files: the install step below does not handle symlinks,
@@ -82,7 +107,7 @@ fi
 echo "==> target: $PI ($MODE: ${components[*]})"
 OUT="$(mktemp)"
 STAGE="$(ssh "${SSH_OPTS[@]}" "$PI" mktemp -d /tmp/pms-deploy.XXXXXX)" || { rm -f "$OUT"; die "cannot reach $PI"; }
-trap 'rm -f "$OUT"; ssh "${SSH_OPTS[@]}" "$PI" rm -rf "$STAGE" || true' EXIT
+trap 'rm -f "$OUT"; [ -z "$MANIFESTS" ] || rm -rf "$MANIFESTS"; ssh "${SSH_OPTS[@]}" "$PI" rm -rf "$STAGE" || true' EXIT
 
 srcs=()
 for r in "${roots[@]}"; do srcs+=("$r/"); done
@@ -164,6 +189,11 @@ if printf '%s\n' "${changed[@]}" | grep -q '^/etc/udev/'; then
   # Re-run add rules for devices already plugged in, e.g. a camera in storage mode.
   udevadm trigger --subsystem-match=block --action=add >/dev/null 2>&1 || true
   echo "==> udev rules reloaded"
+fi
+if printf '%s\n' "${changed[@]}" | grep -qE '^(/usr/local/bin/pms-gateway|/etc/pms/|/etc/systemd/system/pms-gateway\.service)' \
+   && systemctl is-active -q pms-gateway.service; then
+  systemctl restart pms-gateway.service
+  echo "==> pms-gateway restarted"
 fi
 if printf '%s\n' "${changed[@]}" | grep -q '^/etc/sysusers\.d/'; then
   systemd-sysusers

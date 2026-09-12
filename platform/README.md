@@ -6,7 +6,8 @@ specifics belong here, so moving to another board means changing this folder.
 - `rootfs/` — files mirrored onto the Pi's `/`: firewall, gateway user and its
   polkit rules, cloud-init off, network fallback
 - `provision/` — getting a fresh SD card to a reachable Pi, then `base.sh`
-- `deploy.sh` — pushes `platform/rootfs/` and every `services/*/rootfs/`
+- `deploy.sh` — pushes `platform/rootfs/`, `gateway/rootfs/` (with the built
+  binary and every `services/*/service.toml`) and every `services/*/rootfs/`
 
 ## Deploying
 
@@ -15,6 +16,7 @@ platform/deploy.sh --list                # what each component ships
 platform/deploy.sh --check               # what differs on the Pi, changes nothing
 platform/deploy.sh                       # install everything
 platform/deploy.sh camera-drive          # install one component
+platform/deploy.sh gateway               # needs gateway/build.sh first
 PI=joao@10.42.0.1 platform/deploy.sh     # another address
 ```
 
@@ -32,6 +34,7 @@ After installing, only what changed is reloaded:
 | `/etc/systemd/` | `daemon-reload`; units are not restarted |
 | `/etc/udev/` | reload rules, replay block `add` events |
 | `/etc/sysusers.d/` | `systemd-sysusers` |
+| `pms-gateway` binary or unit, `/etc/pms/` | restart `pms-gateway` if it is running |
 | `/etc/nftables.conf` | parsed with `nft -c` before anything is installed; if the firewall is running it is reloaded behind a 2-minute timer that removes table `inet pms`, and the timer is cancelled from a new SSH connection |
 
 ## provision/

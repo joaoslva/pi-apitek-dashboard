@@ -4,9 +4,8 @@ description = "Shared notes for the meeting"
 icon        = "pad"
 
 [route]
-prefix       = "/pad/"
-upstream     = "http://127.0.0.1:9001"
-strip_prefix = true
+port     = 8443
+upstream = "http://127.0.0.1:9001"
 
 [run]
 units         = ["etherpad.service"]

@@ -4,7 +4,8 @@ A Raspberry Pi Zero 2 W as a pocket server: carry it to a meeting, switch it on,
 colleagues join its hotspot and use Etherpad through a login gateway. The
 existing camera-drive project becomes one service among several.
 
-Status: Phase 1 done (2026-09-12). Next: Phase 2.
+Status: Phase 2 deployed (2026-09-12); owner account and a browser check
+pending. Next: Phase 3.
 
 ## Settled decisions
 
@@ -14,7 +15,10 @@ Status: Phase 1 done (2026-09-12). Next: Phase 2.
 - Raspberry Pi OS on Debian 13 trixie, arm64, kernel 6.18 — no re-flash needed.
 
 **Access and security**
-- HTTPS with a self-signed certificate.
+- HTTPS. The gateway loads cert/key files and generates a self-signed pair only
+  when they are missing (decided 2026-09-12). Let's Encrypt later via DNS-01
+  (needs a domain + DNS API; public A records may point at 10.42.0.1 and the
+  home IP; renew from a machine with internet and deploy the files).
 - Auth model: `owner` (everything + admin) plus per-user service grants at
   `use` or `admin` level. Users for now: owner and their boss.
 - Every service binds `127.0.0.1` only; nftables allows 22, 80 (redirect),
@@ -32,8 +36,14 @@ Status: Phase 1 done (2026-09-12). Next: Phase 2.
   in Docker's `golang` image), one arm64 binary with HTML/CSS/JS embedded.
 - Replaces nginx: TLS, auth, reverse proxy (websockets), portal, owner admin UI,
   service manager, network manager. Pure-Go SQLite.
-- Path-based routing: `/pad/`, `/camera/`, `/admin/`. Works the same on the
-  hotspot and on a joined network.
+- **Port per service** (decided 2026-09-12, replaces path prefixes): login,
+  portal and admin on `https://<host>/` (443); each service on its own HTTPS
+  port in 8443–8450 (Etherpad 8443, camera 8444). Browsers isolate origins by
+  port, so an XSS in a proxied app cannot read or drive the gateway's pages;
+  and apps run at their own root, so no prefix rewriting. The session cookie
+  (`__Host-`, host-only) is still sent to every port: the proxy strips it
+  before forwarding, and non-GET requests and websocket upgrades must carry
+  an `Origin` equal to the port's own origin (cross-port CSRF).
 - Each service folder has a `service.toml` (name, route prefix, upstream port,
   systemd unit, permissions, memory budget, icon, exclusive group). The menu
   and the access rules are generated from it.
@@ -112,6 +122,7 @@ pi-mobile-server/
 │   ├── rootfs/              # files mirrored onto the Pi (units, nft, polkit, NM, zram…)
 │   └── deploy.sh            # --list / --check / install; platform + services/*/rootfs
 ├── gateway/                 # Go: auth, proxy, portal, admin, service + network manager
+│                            #   build.sh, user.sh, rootfs/ (unit, gateway.toml, built binary)
 └── services/
     ├── README.md            # service.toml format and access rules
     ├── camera-drive/        # README lessons, service.toml, rootfs/ (app, units, udev)
@@ -156,7 +167,38 @@ pi-mobile-server/
      behind a 2-minute revert timer that a fresh SSH connection cancels.
 2. **Gateway MVP** — TLS (self-signed), login, sessions, CSRF, rate limit,
    owner UI for users and grants, portal menu from `service.toml`, reverse
-   proxy with websockets, audit log.
+   proxy with websockets, audit log. Design (branch `phase-2-gateway`):
+   - `gateway/`: one Go `main` package, built by `gateway/build.sh` in
+     `golang:1.26-trixie` (CGO off, arm64) into
+     `gateway/rootfs/usr/local/bin/pms-gateway` (gitignored); `gateway` is a
+     deploy.sh component with its unit and `/etc/pms/gateway.toml`.
+     deploy.sh also ships `services/<id>/service.toml` to
+     `/etc/pms/services/<id>.toml`.
+   - Unit runs as `pms-gateway`, `StateDirectory=pms-gateway` (SQLite DB,
+     generated TLS), ambient `CAP_NET_BIND_SERVICE` only, full sandboxing.
+   - SQLite (modernc, WAL): users (argon2id m=19 MiB t=2 p=1, at most 2
+     hashes at once), grants (use/admin per service), sessions (only the
+     SHA-256 of the token stored; idle 12 h, max 7 days), audit log.
+   - Owner created from the CLI only (`pms-gateway user add NAME --owner`,
+     password on stdin, via a laptop script) — no first-visit setup page
+     that anyone on the hotspot could claim. The UI cannot create owners.
+   - Login: rate limit per IP and per IP+user, dummy hash for unknown users,
+     `next` must be https on the same host and a known port.
+   - Gateway pages: no JavaScript, strict CSP, per-session CSRF token plus
+     Origin check on every POST.
+   - Proxy: session check, access rules from service.toml (404 without a
+     grant), strips the gateway cookie both ways, `X-Forwarded-*` and
+     `X-Pms-User`/`X-Pms-Level` set, immediate flush for streams, friendly
+     502 when the service is down (starting it is Phase 3).
+   - Port 80 redirect is off until Phase 4 frees port 80 from camera-drive;
+     until then the camera upstream is its current `127.0.0.1:80`.
+   - Deployed 2026-09-12: 8 tests pass (paths, rules, origin, next URL,
+     passwords, proxy incl. cookie stripping and websockets, login + rate
+     limit + CSRF); 12.9 MB binary; 25 MB RAM on the Pi; `systemd-analyze
+     security` 1.5; enabled at boot. Signed out, 8443/8444 redirect to login.
+     Details in `gateway/README.md`.
+   - Until Phase 4 the camera app is still reachable directly on port 80,
+     bypassing the gateway.
 3. **Service manager** — start/stop via systemd, off/on/auto, budgets and
    exclusive groups, "starting…" page, all-off at boot, stop-all on shutdown,
    profiles.
