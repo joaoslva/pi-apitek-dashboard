@@ -1,13 +1,12 @@
 # platform
 
-Everything about the Pi itself, as opposed to any one service. Hardware
-specifics belong here, so moving to another board means changing this folder.
+Everything about the Pi itself, as opposed to the camera app in `app/`.
+Hardware specifics belong here, so moving to another board means changing
+this folder.
 
-- `rootfs/` — files mirrored onto the Pi's `/`: firewall, gateway user and its
-  polkit rules, cloud-init off, network fallback
+- `rootfs/` — files mirrored onto the Pi's `/`: the network fallback, cloud-init off
 - `provision/` — getting a fresh SD card to a reachable Pi, then `base.sh`
-- `deploy.sh` — pushes `platform/rootfs/`, `gateway/rootfs/` (with the built
-  binary and every `services/*/service.toml`) and every `services/*/rootfs/`
+- `deploy.sh` — pushes `platform/rootfs/` and `app/rootfs/`
 
 ## Deploying
 
@@ -15,8 +14,7 @@ specifics belong here, so moving to another board means changing this folder.
 platform/deploy.sh --list                # what each component ships
 platform/deploy.sh --check               # what differs on the Pi, changes nothing
 platform/deploy.sh                       # install everything
-platform/deploy.sh camera-drive          # install one component
-platform/deploy.sh gateway               # needs gateway/build.sh first
+platform/deploy.sh app                   # install one component
 PI=joao@10.42.0.1 platform/deploy.sh     # another address
 ```
 
@@ -33,9 +31,6 @@ After installing, only what changed is reloaded:
 |---|---|
 | `/etc/systemd/` | `daemon-reload`; units are not restarted |
 | `/etc/udev/` | reload rules, replay block `add` events |
-| `/etc/sysusers.d/` | `systemd-sysusers` |
-| `pms-gateway` binary or unit, `/etc/pms/` | restart `pms-gateway` if it is running |
-| `/etc/nftables.conf` | parsed with `nft -c` before anything is installed; if the firewall is running it is reloaded behind a 2-minute timer that removes table `inet pms`, and the timer is cancelled from a new SSH connection |
 
 ## provision/
 
@@ -46,13 +41,15 @@ deploy onto a new card; it is safe to re-run:
 ssh -i ~/.ssh/pi_camera_drive joao@192.168.1.206 sudo bash -s < platform/provision/base.sh
 ```
 
-It creates the gateway user, deletes cloud-init's netplan WiFi profile, sets
-the hostname (`pocketserver`, or the first argument), disables ModemManager
-and bluetooth, removes the recovery leftovers (`netreport.service`, which held
-boot for ~50 s), keeps one of the three identical NOPASSWD sudo files, locks
-the admin's empty password, enables nftables, adds `cgroup_enable=memory` to
-`cmdline.txt` and lists anything in system paths not owned by root. Reboot
-afterwards if it says so.
+It deletes cloud-init's netplan WiFi profile (and the yaml holding the WiFi
+password in plain text), sets the hostname (`cameradrive`, or the first
+argument), disables ModemManager and bluetooth, removes what the
+pi-mobile-server detour installed (gateway, its user and polkit rule, the
+nftables firewall, `cgroup_enable=memory`; see `docs/history.md`), removes the
+recovery leftovers (`netreport.service`, which held boot for ~50 s), keeps one
+of the three identical NOPASSWD sudo files, locks the admin's empty password
+and lists anything in system paths not owned by root. Reboot afterwards if it
+says so.
 
 From the first bring-up of camera-drive, kept because they still work:
 
@@ -62,7 +59,6 @@ From the first bring-up of camera-drive, kept because they still work:
   run `base.sh` once the Pi is back.
 - `diagnose-pi-card.sh` — read-only version of the above.
 - `fill-secrets.sh`, `boot-originals/` — the cloud-init route, which failed
-  (see "cloud-init's NoCloud datasource" in `services/camera-drive/README.md`).
+  (see "cloud-init's NoCloud datasource" in `docs/camera-drive.md`).
 - `setup-ap.sh` — creates the `camera-drive-ap` hotspot profile that
-  `camera-net-fallback` switches to. Replaced by the Island/Join network modes
-  in Phase 6.
+  `camera-net-fallback` switches to.

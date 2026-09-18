@@ -13,17 +13,74 @@
 # be its own island is a device you cannot update, and one failed boot away
 # from needing the SD card pulled.
 #
-# Run every minute by camera-net-fallback.timer.
+# Run by camera-net-fallback.timer: 15 s after boot, then every 30 s. Only
+# networks that a scan actually shows are tried, so with none in range the
+# access point is up a few seconds after the first run instead of after every
+# profile has timed out.
 
 set -uo pipefail
 
 IFACE="${IFACE:-wlan0}"
 AP_CON="${AP_CON:-camera-drive-ap}"
 LOG=/srv/camera-drive/net.log
+# While hosting, how often to look for a known network. Scanning on the one
+# radio that runs the AP briefly disturbs phones connected to it.
+AP_SCAN_EVERY=120
+SCAN_STAMP=/run/camera-net-fallback.scan
 
 log() { echo "$(date -Is) $*" >> "$LOG" 2>/dev/null; }
 
 command -v nmcli >/dev/null || exit 0
+
+# NetworkManager's numeric device state: 20 unavailable, 30 disconnected,
+# 40-90 connecting, 100 connected.
+dev_state() {
+  nmcli -t -g GENERAL.STATE device show "$IFACE" 2>/dev/null | cut -d' ' -f1
+}
+
+active_con() {
+  nmcli -t -f NAME,DEVICE connection show --active \
+    | awk -F: -v d="$IFACE" '$2==d{print $1}' | head -1
+}
+
+# SSIDs in range, one per line.
+scan() {
+  touch "$SCAN_STAMP"
+  nmcli -t -f SSID device wifi list ifname "$IFACE" --rescan yes 2>/dev/null | sed '/^$/d'
+}
+
+# A known network is worth trying if a scan shows it, or if it is hidden
+# (hidden networks never show up in a scan).
+in_range() {
+  local con=$1 visible=$2 ssid
+  ssid="$(nmcli -t -g 802-11-wireless.ssid connection show "$con" 2>/dev/null)"
+  [ -n "$ssid" ] || return 1
+  grep -qxF "$ssid" <<< "$visible" && return 0
+  [ "$(nmcli -t -g 802-11-wireless.hidden connection show "$con" 2>/dev/null)" = yes ]
+}
+
+# Early in boot the radio is not up yet (it appears ~21 s after power on):
+# wait for it rather than for the next run.
+for _ in $(seq 60); do
+  state="$(dev_state)"
+  [ -n "$state" ] && [ "$state" -ge 30 ] && break
+  sleep 1
+done
+[ -n "$state" ] && [ "$state" -ge 30 ] || exit 0
+
+# NetworkManager joins known networks by itself, at boot and after a drop,
+# about a second after the radio is free. Decide only once it is connected,
+# or has sat disconnected for 5 s; a join in progress gets up to 25 s.
+calm=0
+for _ in $(seq 25); do
+  state="$(dev_state)"
+  case "$state" in
+    100) break ;;
+    30)  calm=$((calm + 1)); [ "$calm" -ge 5 ] && break ;;
+    *)   calm=0 ;;
+  esac
+  sleep 1
+done
 
 # Every wifi profile except the access point one -- these are the networks we
 # would rather be on.
@@ -33,8 +90,7 @@ mapfile -t CLIENT_CONS < <(
     | grep -vxF "$AP_CON"
 )
 
-active="$(nmcli -t -f NAME,DEVICE connection show --active \
-          | awk -F: -v d="$IFACE" '$2==d{print $1}' | head -1)"
+active="$(active_con)"
 
 # --- already on a real network: nothing to do -----------------------------
 if [ -n "$active" ] && [ "$active" != "$AP_CON" ]; then
@@ -43,36 +99,39 @@ fi
 
 # --- currently self-hosting: look for a known network to rejoin -----------
 if [ "$active" = "$AP_CON" ]; then
+  last="$(stat -c %Y "$SCAN_STAMP" 2>/dev/null || echo 0)"
+  [ $(( $(date +%s) - last )) -ge "$AP_SCAN_EVERY" ] || exit 0
   # Scanning while running an AP is unreliable on a single radio, so this may
   # legitimately find nothing. That is fine -- we simply stay an AP.
-  visible="$(nmcli -t -f SSID device wifi list --rescan yes 2>/dev/null | sed '/^$/d')"
+  visible="$(scan)"
   [ -z "$visible" ] && exit 0
 
   for con in "${CLIENT_CONS[@]}"; do
-    ssid="$(nmcli -t -g 802-11-wireless.ssid connection show "$con" 2>/dev/null)"
-    [ -z "$ssid" ] && continue
-    if grep -qxF "$ssid" <<< "$visible"; then
-      log "known network '$ssid' is back, leaving AP mode"
-      nmcli connection down "$AP_CON" >/dev/null 2>&1
-      sleep 2
-      if nmcli connection up "$con" >/dev/null 2>&1; then
-        log "rejoined $ssid"
-        exit 0
-      fi
-      log "failed to rejoin $ssid, returning to AP"
-      nmcli connection up "$AP_CON" >/dev/null 2>&1
+    grep -qxF "$(nmcli -t -g 802-11-wireless.ssid connection show "$con" 2>/dev/null)" <<< "$visible" \
+      || continue
+    log "known network '$con' is back, leaving AP mode"
+    nmcli connection down "$AP_CON" >/dev/null 2>&1
+    sleep 2
+    if nmcli -w 30 connection up "$con" >/dev/null 2>&1; then
+      log "rejoined $con"
       exit 0
     fi
+    log "failed to rejoin $con, returning to AP"
+    nmcli connection up "$AP_CON" >/dev/null 2>&1
+    exit 0
   done
   exit 0
 fi
 
-# --- nothing is up: try the known networks, then fall back to the AP ------
+# --- nothing is up: try the known networks in range, else the AP ----------
+visible="$(scan)"
 for con in "${CLIENT_CONS[@]}"; do
-  if nmcli connection up "$con" >/dev/null 2>&1; then
+  in_range "$con" "$visible" || continue
+  if nmcli -w 30 connection up "$con" >/dev/null 2>&1; then
     log "joined $con"
     exit 0
   fi
+  log "could not join $con"
 done
 
 if nmcli -t -f NAME connection show | grep -qxF "$AP_CON"; then

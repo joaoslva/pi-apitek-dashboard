@@ -2,11 +2,11 @@
 Description=Periodically check camera-drive network reachability
 
 [Timer]
-# Wait a bit after boot so NetworkManager gets its own chance to autoconnect
-# before we start second-guessing it.
-OnBootSec=75s
-OnUnitActiveSec=60s
-AccuracySec=5s
+# The script waits for the radio (up ~21 s after power on) and for
+# NetworkManager's own join, so starting early does not second-guess it.
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=2s
 
 [Install]
 WantedBy=timers.target
