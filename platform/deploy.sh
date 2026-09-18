@@ -3,16 +3,16 @@
 # Push files onto the Raspberry Pi. Each component owns a rootfs/ tree that
 # mirrors the Pi's /:
 #
-#   platform/rootfs/usr/local/bin/foo        ->  /usr/local/bin/foo
-#   services/<name>/rootfs/etc/udev/...      ->  /etc/udev/...
+#   platform/rootfs/usr/local/bin/foo  ->  /usr/local/bin/foo
+#   app/rootfs/etc/udev/...            ->  /etc/udev/...
 #
 # Usage:
 #   platform/deploy.sh [--list|--check] [--no-reload] [component ...]
 #
-#   component    "platform" or a services/ folder name; default: all of them
+#   component    "platform" or "app"; default: both
 #   --list       print what each component ships, touch nothing
 #   --check      show what differs on the Pi, change nothing
-#   --no-reload  install without reloading systemd, udev, users or firewall
+#   --no-reload  install without reloading systemd or udev
 #
 #   PI=joao@10.42.0.1 platform/deploy.sh
 
@@ -39,12 +39,7 @@ for arg in "$@"; do
   esac
 done
 
-rootfs_of() {
-  case "$1" in
-    platform|gateway) echo "$REPO/$1/rootfs" ;;
-    *)                echo "$REPO/services/$1/rootfs" ;;
-  esac
-}
+rootfs_of() { echo "$REPO/$1/rootfs"; }
 
 # Paths relative to a rootfs, as they will appear on the Pi.
 files_in() {
@@ -52,10 +47,7 @@ files_in() {
 }
 
 if [ ${#components[@]} -eq 0 ]; then
-  components=(platform gateway)
-  for d in "$REPO"/services/*/rootfs; do
-    [ -d "$d" ] && components+=("$(basename "$(dirname "$d")")")
-  done
+  components=(platform app)
 fi
 
 roots=()
@@ -63,28 +55,6 @@ for c in "${components[@]}"; do
   r="$(rootfs_of "$c")"
   [ -d "$r" ] || die "component '$c' has no rootfs ($r)"
   roots+=("$r")
-done
-
-# The gateway also carries every service manifest, since they are its
-# configuration: services/<id>/service.toml -> /etc/pms/services/<id>.toml
-MANIFESTS=""
-trap '[ -z "$MANIFESTS" ] || rm -rf "$MANIFESTS"' EXIT
-for c in "${components[@]}"; do
-  [ "$c" = gateway ] || continue
-  bin="$REPO/gateway/rootfs/usr/local/bin/pms-gateway"
-  if [ "$MODE" != list ]; then
-    [ -x "$bin" ] || die "the gateway is not built: run gateway/build.sh"
-    stale="$(find "$REPO/gateway" -path "$REPO/gateway/rootfs" -prune -o -type f \
-      \( -name '*.go' -o -name '*.html' -o -name '*.css' -o -name 'go.*' \) -newer "$bin" -print)"
-    [ -z "$stale" ] || die "gateway sources are newer than the binary: run gateway/build.sh\n$stale"
-  fi
-  MANIFESTS="$(mktemp -d)"
-  mkdir -p "$MANIFESTS/etc/pms/services"
-  for t in "$REPO"/services/*/service.toml; do
-    [ -f "$t" ] && install -m 644 "$t" "$MANIFESTS/etc/pms/services/$(basename "$(dirname "$t")").toml"
-  done
-  components+=(manifests)
-  roots+=("$MANIFESTS")
 done
 
 # Only regular files: the install step below does not handle symlinks,
@@ -105,21 +75,16 @@ if [ "$MODE" = list ]; then
 fi
 
 echo "==> target: $PI ($MODE: ${components[*]})"
-OUT="$(mktemp)"
-STAGE="$(ssh "${SSH_OPTS[@]}" "$PI" mktemp -d /tmp/pms-deploy.XXXXXX)" || { rm -f "$OUT"; die "cannot reach $PI"; }
-trap 'rm -f "$OUT"; [ -z "$MANIFESTS" ] || rm -rf "$MANIFESTS"; ssh "${SSH_OPTS[@]}" "$PI" rm -rf "$STAGE" || true' EXIT
+STAGE="$(ssh "${SSH_OPTS[@]}" "$PI" mktemp -d /tmp/camera-deploy.XXXXXX)" || die "cannot reach $PI"
+trap 'ssh "${SSH_OPTS[@]}" "$PI" rm -rf "$STAGE" || true' EXIT
 
 srcs=()
 for r in "${roots[@]}"; do srcs+=("$r/"); done
 rsync -rlpt --exclude=__pycache__ -e "ssh $(printf '%q ' "${SSH_OPTS[@]}")" "${srcs[@]}" "$PI:$STAGE/"
 
-ssh "${SSH_OPTS[@]}" "$PI" sudo -n bash -s -- "$STAGE" "$MODE" "$RELOAD" <<'REMOTE' |
+ssh "${SSH_OPTS[@]}" "$PI" sudo -n bash -s -- "$STAGE" "$MODE" "$RELOAD" <<'REMOTE'
 set -euo pipefail
 S=$1 MODE=$2 RELOAD=$3
-
-if [ -f "$S/etc/nftables.conf" ]; then
-  nft -c -f "$S/etc/nftables.conf" || { echo "  nftables.conf does not load; nothing installed" >&2; exit 1; }
-fi
 
 # An old deploy left /, /etc and /usr owned by joao and group-writable, which
 # hands root to anything running as that user. Every directory above a
@@ -190,34 +155,6 @@ if printf '%s\n' "${changed[@]}" | grep -q '^/etc/udev/'; then
   udevadm trigger --subsystem-match=block --action=add >/dev/null 2>&1 || true
   echo "==> udev rules reloaded"
 fi
-if printf '%s\n' "${changed[@]}" | grep -qE '^(/usr/local/bin/pms-gateway|/etc/pms/|/etc/systemd/system/pms-gateway\.service)' \
-   && systemctl is-active -q pms-gateway.service; then
-  systemctl restart pms-gateway.service
-  echo "==> pms-gateway restarted"
-fi
-if printf '%s\n' "${changed[@]}" | grep -q '^/etc/sysusers\.d/'; then
-  systemd-sysusers
-  echo "==> system users created"
-fi
-if printf '%s\n' "${changed[@]}" | grep -qx /etc/nftables.conf && systemctl is-active -q nftables.service; then
-  # A wrong ruleset can cut this very connection. Arm the removal of our
-  # table first; the laptop cancels it from a fresh SSH connection.
-  systemctl stop pms-firewall-revert.timer pms-firewall-revert.service 2>/dev/null || true
-  systemctl reset-failed pms-firewall-revert.service 2>/dev/null || true
-  systemd-run -q --unit=pms-firewall-revert --on-active=2min /usr/sbin/nft destroy table inet pms
-  systemctl reload nftables.service
-  echo "==> firewall reloaded, reverts in 2 min unless confirmed"
-  echo "@@firewall-armed@@"
-fi
 REMOTE
-tee "$OUT" | sed '/^@@firewall-armed@@$/d'
-
-if grep -qx '@@firewall-armed@@' "$OUT"; then
-  if ssh "${SSH_OPTS[@]}" "$PI" sudo -n systemctl stop pms-firewall-revert.timer; then
-    echo "==> firewall confirmed from a new SSH connection"
-  else
-    die "cannot reconnect after the firewall reload; the Pi drops table inet pms within 2 minutes"
-  fi
-fi
 
 echo "==> done"

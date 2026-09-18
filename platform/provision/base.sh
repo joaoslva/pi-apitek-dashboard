@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Platform setup that is state rather than files: services to disable, the
-# hostname, the kernel command line, leftovers from the camera-drive era.
+# Pi setup that is state rather than files: services to disable, the
+# hostname, leftovers from the SD card recovery and from pi-mobile-server.
 # The files come from platform/deploy.sh, which must run first.
 #
 # Runs on the Pi as root, reading the script from stdin:
@@ -13,7 +13,7 @@
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-NEW_HOSTNAME="${1:-pocketserver}"
+NEW_HOSTNAME="${1:-cameradrive}"
 ADMIN_USER="${ADMIN_USER:-joao}"
 
 step() { printf '\n==> %s\n' "$1"; }
@@ -21,13 +21,9 @@ did()  { printf '  %s\n' "$1"; }
 die()  { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
-[ -e /etc/cloud/cloud-init.disabled ] && [ -e /etc/sysusers.d/pms-gateway.conf ] \
-  || die "platform files are missing: run platform/deploy.sh platform first"
+[ -e /etc/cloud/cloud-init.disabled ] \
+  || die "platform files are missing: run platform/deploy.sh first"
 [[ "$NEW_HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "invalid hostname '$NEW_HOSTNAME'"
-
-step "gateway user"
-id pms-gateway >/dev/null 2>&1 || systemd-sysusers
-did "$(id pms-gateway)"
 
 step "cloud-init leftovers"
 # cloud-init.disabled (from deploy.sh) stops it running. The WiFi it rendered
@@ -79,16 +75,70 @@ for u in ModemManager.service bluetooth.service; do
   fi
 done
 
-step "gateway"
+step "pi-mobile-server leftovers"
+# The multi-service detour (Sept 2026, tag pi-mobile-server-final) added a
+# login gateway, its user and polkit rules, a firewall and the memory cgroup.
+# The camera app is reached directly again, on port 80.
+removed=0
 if [ -e /etc/systemd/system/pms-gateway.service ]; then
-  if ! systemctl is-enabled -q pms-gateway.service; then
-    systemctl enable -q pms-gateway.service
-    did "pms-gateway enabled at boot"
-  fi
-  did "pms-gateway is $(systemctl is-active pms-gateway.service)"
-else
-  did "not deployed yet: platform/deploy.sh gateway, then run this again"
+  systemctl disable --now -q pms-gateway.service || true
+  rm -f /etc/systemd/system/pms-gateway.service
+  removed=1
 fi
+for f in /usr/local/bin/pms-gateway /etc/pms /var/lib/pms-gateway /var/lib/private/pms-gateway \
+         /etc/polkit-1/rules.d/50-pms-gateway.rules /etc/sysusers.d/pms-gateway.conf; do
+  if [ -e "$f" ]; then rm -rf "$f"; did "removed $f"; removed=1; fi
+done
+if id pms-gateway >/dev/null 2>&1; then
+  userdel pms-gateway
+  did "removed user pms-gateway"
+fi
+if [ -e /etc/systemd/system/nftables.service.d/pms.conf ]; then
+  # Stop while the drop-in still limits the stop to our own table, so
+  # NetworkManager's hotspot tables survive.
+  systemctl disable --now -q nftables.service || true
+  rm -rf /etc/systemd/system/nftables.service.d
+  removed=1
+  did "firewall stopped and disabled"
+fi
+nft destroy table inet pms 2>/dev/null || true
+if grep -q 'table inet pms' /etc/nftables.conf 2>/dev/null; then
+  # Debian's stock file, as shipped by the nftables package.
+  cat > /etc/nftables.conf <<'NFT'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+	chain input {
+		type filter hook input priority filter;
+	}
+	chain forward {
+		type filter hook forward priority filter;
+	}
+	chain output {
+		type filter hook output priority filter;
+	}
+}
+NFT
+  chmod 755 /etc/nftables.conf
+  did "/etc/nftables.conf back to Debian's stock file"
+fi
+CMDLINE=/boot/firmware/cmdline.txt
+if grep -qw 'cgroup_enable=memory' "$CMDLINE"; then
+  sed -i '1s/[[:space:]]*cgroup_enable=memory//' "$CMDLINE"
+  did "removed cgroup_enable=memory from $CMDLINE (reboot to apply)"
+fi
+if [ -e "$CMDLINE.pre-pms" ] && cmp -s "$CMDLINE" "$CMDLINE.pre-pms"; then
+  rm -f "$CMDLINE.pre-pms"
+fi
+if [ "$removed" = 1 ]; then
+  systemctl daemon-reload
+  # Port 80 was the gateway's; the camera app takes it back.
+  systemctl try-restart camera-drive-web.service
+  did "camera-drive-web restarted"
+fi
+did "nothing of it left"
 
 step "leftovers from the SD card recovery"
 # netreport sleeps 45 s inside a oneshot, holding boot open for ~50 s.
@@ -127,29 +177,6 @@ if [ "$(passwd -S "$ADMIN_USER" | awk '{print $2}')" = NP ]; then
 fi
 did "$(passwd -S "$ADMIN_USER")"
 
-step "firewall"
-nft -c -f /etc/nftables.conf || die "/etc/nftables.conf does not load"
-if ! systemctl is-enabled -q nftables.service; then
-  systemctl enable -q nftables.service
-  did "nftables enabled at boot"
-fi
-if ! nft list table inet pms >/dev/null 2>&1; then
-  systemctl restart nftables.service
-  did "ruleset loaded"
-fi
-did "table inet pms is loaded"
-
-step "kernel command line"
-# The firmware adds cgroup_disable=memory; a later cgroup_enable=memory wins.
-# MemoryMax= in the service manager needs it.
-CMDLINE=/boot/firmware/cmdline.txt
-if ! grep -qw 'cgroup_enable=memory' "$CMDLINE"; then
-  cp "$CMDLINE" "$CMDLINE.pre-pms"
-  sed -i '1s/[[:space:]]*$/ cgroup_enable=memory/' "$CMDLINE"
-  [ "$(wc -l < "$CMDLINE")" -le 1 ] || die "cmdline.txt is no longer one line; restore $CMDLINE.pre-pms"
-  did "added cgroup_enable=memory (backup: $CMDLINE.pre-pms)"
-fi
-
 step "anything in system paths not owned by root"
 # deploy.sh fixes the directories above the files it ships; this catches the rest.
 find / -xdev \( -path /home -o -path /srv -o -path /tmp -o -path /var/tmp -o -path /var/lib \
@@ -157,8 +184,8 @@ find / -xdev \( -path /home -o -path /srv -o -path /tmp -o -path /var/tmp -o -pa
   -o \( ! -user root -o -type d -perm /022 ! -perm -1000 \) -print | sed 's/^/  !! /'
 
 step "done"
-if grep -qw memory /sys/fs/cgroup/cgroup.controllers; then
-  did "no reboot needed"
+if grep -qw 'cgroup_enable=memory' /proc/cmdline; then
+  did "reboot to finish: sudo systemctl reboot"
 else
-  did "reboot for the memory cgroup: sudo systemctl reboot"
+  did "no reboot needed"
 fi

@@ -26,16 +26,12 @@ tell which mode you plugged in as and react accordingly.
 
 ## Getting to it
 
-Through the gateway only: sign in at `https://<pi>/` and pick Camera, or go
-straight to `https://<pi>:8444/`. The app itself listens on `127.0.0.1:8081`;
-plain `http://<pi>/` now just redirects to the gateway.
+- On a known WiFi network: `http://cameradrive.local/` (or its IP)
+- With no network around: the Pi raises its own AP, then `http://10.42.0.1/`
 
-- On a known WiFi network: `https://pocketserver.local/` (or its IP; the host
-  was `cameradrive` before Phase 1)
-- With no network around: the Pi raises its own AP, then `https://10.42.0.1/`
-
-It switches between the two by itself, checking once a minute. It prefers being
-a normal client; the AP is the fallback. See `camera-net-fallback`.
+It switches between the two by itself. It prefers being a normal client; the AP
+is the fallback. See `camera-net-fallback`, run 15 s after boot and then every
+30 s.
 
 **Verified end to end on 2026-08-17**, by renaming the known SSIDs to something
 nonexistent so the real fallback path had to run:
@@ -48,7 +44,15 @@ nonexistent so the real fallback path had to run:
           curl http://10.42.0.1/ -> 200
 ```
 
-AP comes up about 75 seconds after the known network vanishes.
+AP came up about 75 seconds after the known network vanished. That was the
+first version, which waited 75 s after boot and then tried every known
+network until each timed out. Since 2026-09-18 it waits for the radio, gives
+NetworkManager 5 quiet seconds to join by itself, scans once and tries only
+known networks the scan shows. Tested the same way on 2026-09-18 with a
+reboot: the hotspot was active **29 s after the kernel started** (about 35 s
+from power on), and once the known network was back the Pi rejoined it
+within 80 s (while hosting it scans every 2 minutes, since scanning on the AP's
+own radio disturbs connected phones).
 
 ### If the AP loads nothing on your phone
 
@@ -58,13 +62,12 @@ The Pi is almost certainly fine — check the phone first, in this order:
    `10.42.0.1` into a path that no longer exists. This is the one that caught us.
 2. **Mobile data.** A WiFi network with no internet makes phones quietly send
    everything over cellular. Tell it to stay connected, or turn data off.
-3. Type the address with a scheme so the browser does not run a search. (Before
-   the gateway this said `http://`; `http://` still works, it redirects.)
+3. Type `http://` explicitly so the browser does not try HTTPS or a search.
 
 To confirm which side was at fault without a phone, a one-off `ap-diag.sh`
 dropped the Pi to AP mode, curled its own address and logged `ip addr`, the
 listening sockets and the firewall ruleset, while a separately armed timer
-restored the WiFi. It was removed in Phase 1; the lesson stays: always arm the
+restored the WiFi. It has since been removed; the lesson stays: always arm the
 revert timer BEFORE breaking the network.
 
 ## What is on the Pi
@@ -85,9 +88,9 @@ revert timer BEFORE breaking the network.
 /srv/camera-drive/status.json      last offload result, read by the web UI
 ```
 
-Deploy changes with `platform/deploy.sh camera-drive` from the repo root. It
-mirrors everything under `rootfs/` onto the Pi, preserving paths. The network
-fallback and the provisioning scripts moved to `platform/`.
+Deploy changes with `platform/deploy.sh app` from the repo root. It mirrors
+everything under `app/rootfs/` onto the Pi, preserving paths. The network
+fallback and the provisioning scripts are in `platform/`.
 
 ## The deletion rule
 
